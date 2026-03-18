@@ -314,6 +314,8 @@ These were discussed and decided. Do not revisit without user approval.
 | Onset threshold | Manual + automatic (both available) | Flexibility |
 | Output | Single stereo mix, per-voice level control | Simplicity first |
 | Phase source | Per voice: Master / Lock / Ratio | Enables polyrhythm + nesting |
+| Warp animation | Supported — warp is an AudioParameter, animated via DAW automation or future LFO | Phase jumps on hard cuts are acceptable / musically interesting |
+| Ratio UI | Curated button strip (1:1 2:1 3:2 4:3 5:4 7:4 7:8 etc.) + free N:D integer entry | Curated sets N/D boxes; free entry overrides |
 
 ---
 
