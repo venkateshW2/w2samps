@@ -1,7 +1,7 @@
 # CLAUDE.md — W2 Audio Plugs
 
 Context file for Claude Code. Read this before making changes.
-Last updated: 2026-03-18
+Last updated: 2026-03-19
 
 ---
 
@@ -30,7 +30,8 @@ First build downloads JUCE 8.0.7 + clap-juce-extensions via CMake FetchContent.
 Subsequent builds are fast (only changed .cpp files recompile).
 
 Outputs in `build/W2Sampler_artefacts/Debug/`:
-- `Standalone/W2 Sampler.app`   ← run directly
+
+- `Standalone/W2 Sampler.app` ← run directly
 - `VST3/W2 Sampler.vst3`
 - `AU/W2 Sampler.component`
 - `CLAP/W2 Sampler.clap`
@@ -39,14 +40,14 @@ Outputs in `build/W2Sampler_artefacts/Debug/`:
 
 ## Source Files — Current State
 
-| File | Purpose |
-|------|---------|
-| `CMakeLists.txt` | Entire build: FetchContent deps, JUCE plugin, source list |
-| `src/EuclideanSequencer.h` | Bjorklund algorithm — header-only, no JUCE |
-| `src/SamplerVoice.h` | DSP chain: sample + ADSR + distortion + filter + reverb |
-| `src/SampleLibrary.h` | Pre-loads a folder into memory, manages navigation |
-| `src/PluginProcessor.h/cpp` | AudioProcessor: params, clock, coordinates DSP |
-| `src/PluginEditor.h/cpp` | JUCE UI: 620×430, waveform, sliders, step grid |
+| File                        | Purpose                                                   |
+| --------------------------- | --------------------------------------------------------- |
+| `CMakeLists.txt`            | Entire build: FetchContent deps, JUCE plugin, source list |
+| `src/EuclideanSequencer.h`  | Bjorklund algorithm — header-only, no JUCE                |
+| `src/SamplerVoice.h`        | DSP chain: sample + ADSR + distortion + filter + reverb   |
+| `src/SampleLibrary.h`       | Pre-loads a folder into memory, manages navigation        |
+| `src/PluginProcessor.h/cpp` | AudioProcessor: params, clock, coordinates DSP            |
+| `src/PluginEditor.h/cpp`    | JUCE UI: 620×430, waveform, sliders, step grid            |
 
 ---
 
@@ -70,6 +71,7 @@ Each voice derives its step timing by reading a **transformed version** of the
 master phase. This is the key architectural idea — see §1.2.
 
 **BPM control:**
+
 - `AudioParameterFloat* bpm` — range 20–300, default 120
 - Shown as a large knob/display on the Master tab
 - Later: sync to host `AudioPlayHead` (read host BPM instead of own param)
@@ -124,6 +126,7 @@ masterPhase (0→1)
 
 **Warp function (③):**
 A single `warp` parameter (-1 → +1):
+
 - `warp = 0`: linear (normal timing)
 - `warp > 0`: exponential — steps early in the pattern happen faster, steps
   at the end are compressed. Feels like the pattern is "rushing."
@@ -131,6 +134,7 @@ A single `warp` parameter (-1 → +1):
   Feels like the pattern "drags then catches up."
 
 Implementation: `warpedPhase = pow(phase, exp(warp * 2.0))`
+
 - warp=0 → exp(0)=1 → pow(x,1) = x (linear)
 - warp=1 → exp(2)≈7.4 → pow(x,7.4) heavy rush at start
 - warp=-1 → exp(-2)≈0.14 → pow(x,0.14) drag at start
@@ -140,6 +144,7 @@ Can be added as a separate param later.
 
 **Inter-voice phase relationships:**
 Each voice has a `phaseSource` option:
+
 - `Master` — reads from the global master phasor (independent)
 - `Lock to V1` — uses Voice 1's transformed phase as input instead of master
 - `Ratio N:M to V1` — derives from Voice 1's phase at a rational ratio
@@ -152,31 +157,32 @@ rate = V2 fires 4 times per one V1 cycle).
 
 **Parameters per voice for phase manipulation:**
 
-| Param | Range | Notes |
-|-------|-------|-------|
-| `rateMultiplier` | 0.125–8.0 | expressed as fraction: 1/8, 1/4, 1/2, 1, 2, 4, 8 |
-| `phaseOffset` | 0.0–1.0 | fraction of a beat |
-| `warp` | -1.0–+1.0 | 0 = linear |
-| `reverse` | bool | play pattern backwards |
-| `phaseSource` | enum | Master / LockV1 / LockV2 / RatioV1 / RatioV2 |
-| `ratioNumerator` | 1–16 | for Ratio mode |
-| `ratioDenominator` | 1–16 | for Ratio mode |
+| Param              | Range     | Notes                                            |
+| ------------------ | --------- | ------------------------------------------------ |
+| `rateMultiplier`   | 0.125–8.0 | expressed as fraction: 1/8, 1/4, 1/2, 1, 2, 4, 8 |
+| `phaseOffset`      | 0.0–1.0   | fraction of a beat                               |
+| `warp`             | -1.0–+1.0 | 0 = linear                                       |
+| `reverse`          | bool      | play pattern backwards                           |
+| `phaseSource`      | enum      | Master / LockV1 / LockV2 / RatioV1 / RatioV2     |
+| `ratioNumerator`   | 1–16      | for Ratio mode                                   |
+| `ratioDenominator` | 1–16      | for Ratio mode                                   |
 
 ### 1.3 — Polyrhythm via Loop Length Fraction
 
 Each voice's step sequencer has:
 
-| Param | Range | Notes |
-|-------|-------|-------|
-| `loopNumerator` | 1–16 | top of time signature |
-| `loopDenominator` | 1–16 | bottom (1=whole, 2=half, 4=quarter, 8=eighth) |
-| `stepsPerLoop` | 1–32 | how many steps in one loop cycle |
-| `euclideanHits` | 0–stepsPerLoop | active hits |
-| `euclideanRotation` | 0–stepsPerLoop-1 | rotate pattern |
+| Param               | Range            | Notes                                         |
+| ------------------- | ---------------- | --------------------------------------------- |
+| `loopNumerator`     | 1–16             | top of time signature                         |
+| `loopDenominator`   | 1–16             | bottom (1=whole, 2=half, 4=quarter, 8=eighth) |
+| `stepsPerLoop`      | 1–32             | how many steps in one loop cycle              |
+| `euclideanHits`     | 0–stepsPerLoop   | active hits                                   |
+| `euclideanRotation` | 0–stepsPerLoop-1 | rotate pattern                                |
 
 **Loop length in beats** = `loopNumerator / loopDenominator`
 
 **Step fire logic (per sample, audio thread):**
+
 ```
 voicePhase = transformedPhase × stepsPerLoop / loopLengthBeats
 currentStep = floor(voicePhase) % stepsPerLoop
@@ -186,15 +192,15 @@ if currentStep != previousStep:
 
 **Examples:**
 
-| loopNum | loopDen | stepsPerLoop | Feel |
-|---------|---------|--------------|------|
-| 4 | 4 | 16 | standard 16th notes in 4/4 |
-| 4 | 4 | 7 | 7-over-4 polyrhythm |
-| 3 | 4 | 7 | 7 steps in 3 beats = 7/8ish |
-| 5 | 4 | 5 | 5/4 time |
-| 3 | 4 | 3 | triplets |
-| 7 | 8 | 7 | 7/8 time signature |
-| 2 | 1 | 32 | 32nd notes over 2 bars |
+| loopNum | loopDen | stepsPerLoop | Feel                        |
+| ------- | ------- | ------------ | --------------------------- |
+| 4       | 4       | 16           | standard 16th notes in 4/4  |
+| 4       | 4       | 7            | 7-over-4 polyrhythm         |
+| 3       | 4       | 7            | 7 steps in 3 beats = 7/8ish |
+| 5       | 4       | 5            | 5/4 time                    |
+| 3       | 4       | 3            | triplets                    |
+| 7       | 8       | 7            | 7/8 time signature          |
+| 2       | 1       | 32           | 32nd notes over 2 bars      |
 
 ### 1.4 — Three VoiceChannels
 
@@ -229,6 +235,7 @@ Upgrade the current one-shot voice to support region-based looping.
 The one-shot behaviour is a special case (no loop = one-shot).
 
 **Region model:**
+
 ```
 |←────────────── sample buffer ──────────────────→|
         |←── play region ──────────────→|
@@ -241,12 +248,12 @@ The one-shot behaviour is a special case (no loop = one-shot).
 
 **Loop modes:**
 
-| Mode | Value | Behaviour |
-|------|-------|-----------|
-| Off | 0 | plays regionStart → regionEnd, stops (one-shot) |
-| Fixed | 1 | loops between loopStart → loopEnd continuously |
-| Random | 2 | on each loop-back, picks random loopStart within region (granular) |
-| Sequential | 3 | on each loop-back, advances loopStart by loopSize (scans through sample) |
+| Mode       | Value | Behaviour                                                                |
+| ---------- | ----- | ------------------------------------------------------------------------ |
+| Off        | 0     | plays regionStart → regionEnd, stops (one-shot)                          |
+| Fixed      | 1     | loops between loopStart → loopEnd continuously                           |
+| Random     | 2     | on each loop-back, picks random loopStart within region (granular)       |
+| Sequential | 3     | on each loop-back, advances loopStart by loopSize (scans through sample) |
 
 **Loop size lock:** when enabled, `loopSize` is fixed (in ms or as beat fraction).
 `loopStart` becomes a single position knob that slides the fixed window.
@@ -264,6 +271,7 @@ Only the sample-read section changes.
 Run offline (message thread) when a file is loaded into a VoiceChannel.
 
 **Algorithm: spectral flux**
+
 1. STFT with 512-sample windows, 256-sample hop
 2. For each window: sum of positive differences vs previous magnitude spectrum
 3. Peak-pick above adaptive threshold
@@ -273,6 +281,7 @@ Run offline (message thread) when a file is loaded into a VoiceChannel.
 Store as `float estimatedBPM` in Entry. Display in UI as hint.
 
 **UI integration:**
+
 - Onset positions shown as tick marks on the waveform display
 - Region/loop handles snap to nearest onset when dragged
 - "Set master BPM to file BPM" button
@@ -306,16 +315,19 @@ Do NOT use `juce::TabbedComponent` — too hard to style.
 
 These were discussed and decided. Do not revisit without user approval.
 
-| Decision | Choice | Reason |
-|----------|--------|--------|
-| UI layout | Tabbed (custom tab strip) | Each voice needs enough room |
-| Loop size unit | Milliseconds (free float) | Musician-friendly |
-| Time signature | loopNumerator / loopDenominator (two int params) | Maps to musical notation |
-| Onset threshold | Manual + automatic (both available) | Flexibility |
-| Output | Single stereo mix, per-voice level control | Simplicity first |
-| Phase source | Per voice: Master / Lock / Ratio | Enables polyrhythm + nesting |
-| Warp animation | Supported — warp is an AudioParameter, animated via DAW automation or future LFO | Phase jumps on hard cuts are acceptable / musically interesting |
-| Ratio UI | Curated button strip (1:1 2:1 3:2 4:3 5:4 7:4 7:8 etc.) + free N:D integer entry | Curated sets N/D boxes; free entry overrides |
+| Decision              | Choice                                                                           | Reason                                                          |
+| --------------------- | -------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| UI layout             | Tabbed (custom tab strip)                                                        | Each voice needs enough room                                    |
+| Loop size unit        | Milliseconds (free float)                                                        | Musician-friendly                                               |
+| Time signature        | loopNumerator / loopDenominator (two int params)                                 | Maps to musical notation                                        |
+| Onset threshold       | Manual + automatic (both available)                                              | Flexibility                                                     |
+| Output                | Single stereo mix, per-voice level control                                       | Simplicity first                                                |
+| Phase source          | Per voice: Master / Lock / Ratio                                                 | Enables polyrhythm + nesting                                    |
+| Warp animation        | Supported — warp is an AudioParameter, animated via DAW automation or future LFO | Phase jumps on hard cuts are acceptable / musically interesting |
+| Ratio UI              | Curated button strip (1:1 2:1 3:2 4:3 5:4 7:4 7:8 etc.) + free N:D integer entry | Curated sets N/D boxes; free entry overrides                   |
+| Loop coord system     | loopStart/loopEnd are **absolute [0,1] fractions of the full buffer** (NOT relative to region). GranularVoice clamps them to region at render time. seqLoopAnchorNorm_ also in absolute buffer space. | Waveform handle positions directly match playback positions — no coordinate conversion needed |
+| Loop handles in Off   | Loop handles always visible regardless of loop mode (Off/Fixed/Rnd/Seq). In Off mode the blue window shows the one-shot playback zone. | User needs to set the playback zone before switching mode |
+| Active tab indicator  | Active tab: kActive (light green) background + 3px bottom border. Inactive tabs: kPanel. | Monochrome theme needs a clear indicator without colour overload |
 
 ---
 
@@ -324,25 +336,25 @@ These were discussed and decided. Do not revisit without user approval.
 These will be replaced with per-voice prefixed params (`v0_`, `v1_`, `v2_`).
 Keep them until Phase 1 is complete to avoid breaking existing sessions.
 
-| Member | ID | Range | Notes |
-|--------|----|-------|-------|
-| `seqSteps` | seqSteps | 1–32 | steps in pattern |
-| `seqHits` | seqHits | 0–32 | active hits |
-| `seqRotation` | seqRotation | 0–31 | pattern rotation |
-| `seqRate` | seqRate | 0.25–4.0 | steps per beat (DEPRECATED: replaced by loopNum/Den) |
-| `sampleGain` | sampleGain | 0–2 | output gain |
-| `pitch` | pitch | -24–+24 semitones | |
-| `attack` | attack | 0.001–2.0 sec | log skew |
-| `decay` | decay | 0.001–2.0 sec | log skew |
-| `sustain` | sustain | 0–1 | |
-| `release` | release | 0.001–4.0 sec | log skew |
-| `filterFreq` | filterFreq | 20–20000 Hz | log skew 0.25 |
-| `filterRes` | filterRes | 0.5–10.0 Q | StateVariableTPT |
-| `distDrive` | distDrive | 0–1 | tanh pre-gain 1×–10× |
-| `reverbMix` | reverbMix | 0–1 | wet level × 0.5 |
-| `reverbSize` | reverbSize | 0–1 | room size |
-| `reverbFreeze` | reverbFreeze | bool | juce::Reverb freeze mode |
-| `sampleAdvanceMode` | sampleAdv | 0/1/2 | Hold/Sequential/Random |
+| Member              | ID           | Range             | Notes                                                |
+| ------------------- | ------------ | ----------------- | ---------------------------------------------------- |
+| `seqSteps`          | seqSteps     | 1–32              | steps in pattern                                     |
+| `seqHits`           | seqHits      | 0–32              | active hits                                          |
+| `seqRotation`       | seqRotation  | 0–31              | pattern rotation                                     |
+| `seqRate`           | seqRate      | 0.25–4.0          | steps per beat (DEPRECATED: replaced by loopNum/Den) |
+| `sampleGain`        | sampleGain   | 0–2               | output gain                                          |
+| `pitch`             | pitch        | -24–+24 semitones |                                                      |
+| `attack`            | attack       | 0.001–2.0 sec     | log skew                                             |
+| `decay`             | decay        | 0.001–2.0 sec     | log skew                                             |
+| `sustain`           | sustain      | 0–1               |                                                      |
+| `release`           | release      | 0.001–4.0 sec     | log skew                                             |
+| `filterFreq`        | filterFreq   | 20–20000 Hz       | log skew 0.25                                        |
+| `filterRes`         | filterRes    | 0.5–10.0 Q        | StateVariableTPT                                     |
+| `distDrive`         | distDrive    | 0–1               | tanh pre-gain 1×–10×                                 |
+| `reverbMix`         | reverbMix    | 0–1               | wet level × 0.5                                      |
+| `reverbSize`        | reverbSize   | 0–1               | room size                                            |
+| `reverbFreeze`      | reverbFreeze | bool              | juce::Reverb freeze mode                             |
+| `sampleAdvanceMode` | sampleAdv    | 0/1/2             | Hold/Sequential/Random                               |
 
 ---
 
@@ -366,6 +378,7 @@ Message thread ──► All UI callbacks
 ```
 
 **Safe cross-thread communication:**
+
 - `AudioParameter*` — atomic internally; message thread writes, audio thread reads
 - `SampleLibrary::currentIndex` — `std::atomic<int>`
 - `isPlaying_` — `std::atomic<bool>`
@@ -375,6 +388,7 @@ Message thread ──► All UI callbacks
   the entry (safe because onset detection runs before the sample is activated)
 
 **Known benign races (documented, acceptable for this codebase):**
+
 - `loadFolder()` while playing: `voice.stop()` called first to minimise window
 - `reverb_.setParameters()` — audio thread only (inside renderBlock)
 
@@ -403,11 +417,11 @@ Gain × velocity → addFrom into output buffer
 On each hit, optionally switch which sample plays before triggering.
 No file I/O — SampleLibrary pre-loads all buffers into memory.
 
-| Mode | Value | Behaviour |
-|------|-------|-----------|
-| Hold | 0 | same sample every hit |
-| Sequential | 1 | next file in folder each hit |
-| Random | 2 | random file from folder each hit |
+| Mode       | Value | Behaviour                        |
+| ---------- | ----- | -------------------------------- |
+| Hold       | 0     | same sample every hit            |
+| Sequential | 1     | next file in folder each hit     |
+| Random     | 2     | random file from folder each hit |
 
 LCG RNG (`audioRng_`) used on audio thread (no shared state).
 
@@ -449,28 +463,33 @@ LCG RNG (`audioRng_`) used on audio thread (no shared state).
 ### Phase 1 — Phasor Clock + 3 Voices + Granular (CURRENT)
 
 #### 1.1 MasterClock
+
 - [ ] `src/MasterClock.h` — phasor tick, BPM param, host sync stub
 - [ ] Wire into PluginProcessor, replace old sample-counter clock
 - [ ] BPM knob in Master tab
 
 #### 1.2 Phase Manipulation
+
 - [ ] `src/PhaseTransform.h` — rate, offset, warp, reverse, step-quantise functions
 - [ ] Per-voice params: rateMultiplier, phaseOffset, warp, reverse
 - [ ] Inter-voice: phaseSource (Master/LockV1/LockV2/RatioV1/RatioV2) + ratioN/D
 - [ ] Phase visualiser on Master tab (3 dots on circle showing current positions)
 
 #### 1.3 Polyrhythm Sequencer
+
 - [ ] Replace seqRate with loopNumerator + loopDenominator per voice
 - [ ] Step-fire logic: `floor(transformedPhase × steps / loopBeats) % steps`
 - [ ] Euclidean pattern per voice (steps, hits, rotation)
 
 #### 1.4 Three VoiceChannels
+
 - [ ] `src/VoiceChannel.h` — owns library + voice + sequencer state
 - [ ] PluginProcessor holds `VoiceChannel voices[3]`
 - [ ] Per-voice params with `v0_`, `v1_`, `v2_` prefix
 - [ ] Per-voice gain, pan, level to output mix
 
 #### 1.5 GranularVoice
+
 - [ ] `src/GranularVoice.h` — replaces SamplerVoice
 - [ ] Region params: regionStart, regionEnd, loopStart, loopEnd (all 0–1)
 - [ ] Loop modes: Off / Fixed / Random / Sequential
@@ -478,6 +497,7 @@ LCG RNG (`audioRng_`) used on audio thread (no shared state).
 - [ ] Same DSP chain (ADSR + distortion + filter + reverb)
 
 #### 1.6 Onset Detection
+
 - [ ] `src/OnsetDetector.h` — spectral flux onset detection
 - [ ] Run on load in SampleLibrary::loadFolder
 - [ ] Store onset positions + estimated BPM in SampleLibrary::Entry
@@ -485,12 +505,14 @@ LCG RNG (`audioRng_`) used on audio thread (no shared state).
 - [ ] Snap region handles to onsets
 
 #### 1.7 Tabbed UI
+
 - [ ] Custom tab strip: [Master] [Voice 1] [Voice 2] [Voice 3]
 - [ ] Master tab: BPM, play/stop, global level, phase circle visualiser
 - [ ] Voice tabs: waveform + region, loop controls, ADSR+FX, seq params, phase params
 - [ ] Window: 700 × 500 px
 
 ### Phase 2 — Preset Snapshot System
+
 - [ ] 16 preset slots per voice (sample index + all voice params snapshot)
 - [ ] Auto-fill from random (ring buffer of last 16 random states)
 - [ ] Preset sequence lane (which preset fires on which step)
@@ -498,16 +520,19 @@ LCG RNG (`audioRng_`) used on audio thread (no shared state).
 - [ ] Randomize as sequencer event layer with chance/probability
 
 ### Phase 3 — ONNX + ML Analysis
+
 - [ ] ONNX Runtime via CMake FetchContent
 - [ ] Instrument classification model (kick/snare/hat/melodic)
 - [ ] Better BPM detection (replace autocorrelation with ML model)
 - [ ] Source separation (advanced)
 
 ### Phase 4 — UI Upgrade
+
 - [ ] WebView frontend (CHOC library)
 - [ ] HTML/CSS/JS UI with C++ DSP backend
 
 ### Phase 5 — Release
+
 - [ ] Code signing + notarisation (macOS distribution requirement)
 - [ ] Windows build (CMake + MSVC or Clang-cl)
 - [ ] Installer packaging

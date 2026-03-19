@@ -1,6 +1,7 @@
 #pragma once
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_audio_formats/juce_audio_formats.h>
+#include "OnsetDetector.h"
 
 /**
  * SampleLibrary — manages a folder of one-shot audio files.
@@ -26,13 +27,18 @@
 class SampleLibrary
 {
 public:
-    /** One loaded sample: decoded audio + metadata. */
+    /** One loaded sample: decoded audio + metadata + onset analysis results. */
     struct Entry
     {
         juce::AudioBuffer<float> buffer;    // decoded PCM audio
         double                   sampleRate = 44100.0;  // original file sample rate
         juce::String             name;      // filename without extension (for UI display)
         juce::File               file;      // original file path
+
+        // Onset detection results (populated after loadFolder via analyseOnsets())
+        // Empty until explicitly requested — onset analysis is expensive.
+        OnsetDetector::Result    onsets;    // onset positions (normalised 0–1) + estimated BPM
+        bool                     onsetsAnalysed = false; // true once analyseOnsets() has run
     };
 
     static constexpr int kMaxSamples = 128;  // safety cap
@@ -83,6 +89,33 @@ public:
             ++loaded;
         }
         return loaded;
+    }
+
+    /**
+     * Run onset detection on one entry (by index).
+     * Call from message thread after loadFolder(). Fills entry->onsets.
+     *
+     * sensitivity  — 0.0 (fewer) → 1.0 (more onsets), see OnsetDetector::analyse()
+     *
+     * Returns false if index is out of range or already analysed.
+     * Set forceRerun=true to re-analyse even if already done.
+     */
+    bool analyseOnsets (int index, float sensitivity = 0.5f, bool forceRerun = false)
+    {
+        auto* e = const_cast<Entry*> (getEntry (index));
+        if (e == nullptr) return false;
+        if (e->onsetsAnalysed && !forceRerun) return false;
+
+        e->onsets         = OnsetDetector::analyse (e->buffer, e->sampleRate, sensitivity);
+        e->onsetsAnalysed = true;
+        return true;
+    }
+
+    /** Analyse onsets for all loaded entries. Can be slow for large folders. */
+    void analyseAllOnsets (float sensitivity = 0.5f)
+    {
+        for (int i = 0; i < getCount(); ++i)
+            analyseOnsets (i, sensitivity, /*forceRerun=*/ false);
     }
 
     bool isEmpty()    const { return entries_.empty(); }

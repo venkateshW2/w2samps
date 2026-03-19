@@ -2,52 +2,77 @@
 #include "PluginEditor.h"
 
 //==============================================================================
+void W2SamplerProcessor::registerVoiceParams (int v, const juce::String& px)
+{
+    auto& p = vp[v];
+
+    auto logR = [] (float mn, float mx) {
+        return juce::NormalisableRange<float> (mn, mx, 0.0f, 0.3f);
+    };
+
+    // Phase source + rate
+    addParameter (p.phaseSource  = new juce::AudioParameterInt   (px+"phSrc",    "Phase Src",     0,  3,   0));
+    addParameter (p.rate         = new juce::AudioParameterFloat (px+"rate",     "Rate",
+                                       juce::NormalisableRange<float> (0.125f, 8.0f, 0.0f, 0.315f), 1.0f));
+
+    // Phase transform
+    addParameter (p.phaseOffset  = new juce::AudioParameterFloat (px+"phOff",    "Ph Offset",  {0.0f, 1.0f},   0.0f));
+    addParameter (p.warp         = new juce::AudioParameterFloat (px+"warp",     "Warp",       {-1.0f, 1.0f},  0.0f));
+    addParameter (p.reverse      = new juce::AudioParameterBool  (px+"rev",      "Reverse",    false));
+    addParameter (p.quantiseAmt  = new juce::AudioParameterFloat (px+"quant",    "Quantise",   {0.0f, 1.0f},   0.0f));
+
+    // Euclidean
+    addParameter (p.seqSteps     = new juce::AudioParameterInt   (px+"steps",    "Steps",      1, 32, 16));
+    addParameter (p.seqHits      = new juce::AudioParameterInt   (px+"hits",     "Hits",       0, 32,  4));
+    addParameter (p.seqRotation  = new juce::AudioParameterInt   (px+"rot",      "Rotation",   0, 31,  0));
+    addParameter (p.sampleAdv    = new juce::AudioParameterInt   (px+"smpAdv",   "Sample Adv", 0,  2,  0));
+    addParameter (p.rndFxChance  = new juce::AudioParameterFloat (px+"rndFx",    "Rnd FX %",   {0.0f, 1.0f},   0.0f));
+
+    // Pitch + ADSR
+    addParameter (p.pitch        = new juce::AudioParameterFloat (px+"pitch",    "Pitch",
+                                       juce::NormalisableRange<float> (-24.0f, 24.0f, 0.01f), 0.0f));
+    addParameter (p.attack       = new juce::AudioParameterFloat (px+"att",      "Attack",   logR (0.001f, 2.0f), 0.005f));
+    addParameter (p.decay        = new juce::AudioParameterFloat (px+"dec",      "Decay",    logR (0.001f, 2.0f), 0.1f));
+    addParameter (p.sustain      = new juce::AudioParameterFloat (px+"sus",      "Sustain",  {0.0f, 1.0f},        0.8f));
+    addParameter (p.release      = new juce::AudioParameterFloat (px+"rel",      "Release",  logR (0.001f, 4.0f), 0.2f));
+
+    // Filter
+    addParameter (p.filterFreq   = new juce::AudioParameterFloat (px+"fltFreq",  "Flt Freq",
+                                       juce::NormalisableRange<float> (20.0f, 20000.0f, 0.0f, 0.25f), 20000.0f));
+    addParameter (p.filterRes    = new juce::AudioParameterFloat (px+"fltRes",   "Flt Res",    {0.5f, 10.0f}, 0.707f));
+
+    // FX
+    addParameter (p.distDrive    = new juce::AudioParameterFloat (px+"drive",    "Drive",      {0.0f, 1.0f}, 0.0f));
+    addParameter (p.reverbMix    = new juce::AudioParameterFloat (px+"rvbMix",   "Rvb Mix",    {0.0f, 1.0f}, 0.0f));
+    addParameter (p.reverbSize   = new juce::AudioParameterFloat (px+"rvbSize",  "Rvb Size",   {0.0f, 1.0f}, 0.5f));
+    addParameter (p.reverbFreeze = new juce::AudioParameterBool  (px+"freeze",   "Freeze",     false));
+    addParameter (p.gain         = new juce::AudioParameterFloat (px+"gain",     "Gain",       {0.0f, 2.0f}, 1.0f));
+
+    // Region + Loop
+    addParameter (p.regionStart  = new juce::AudioParameterFloat (px+"regSt",    "Rgn Start",  {0.0f, 1.0f}, 0.0f));
+    addParameter (p.regionEnd    = new juce::AudioParameterFloat (px+"regEn",    "Rgn End",    {0.0f, 1.0f}, 1.0f));
+    addParameter (p.loopMode     = new juce::AudioParameterInt   (px+"loopMode", "Loop Mode",   0, 3,  0));
+    addParameter (p.loopStart    = new juce::AudioParameterFloat (px+"loopSt",   "Loop Start", {0.0f, 1.0f}, 0.0f));
+    addParameter (p.loopEnd      = new juce::AudioParameterFloat (px+"loopEn",   "Loop End",   {0.0f, 1.0f}, 1.0f));
+    addParameter (p.loopSizeMs   = new juce::AudioParameterFloat (px+"loopMs",   "Loop Ms",
+                                       juce::NormalisableRange<float> (5.0f, 5000.0f, 0.0f, 0.3f), 100.0f));
+    addParameter (p.loopSizeLock = new juce::AudioParameterBool  (px+"loopLock", "Loop Lock",  false));
+}
+
+//==============================================================================
 W2SamplerProcessor::W2SamplerProcessor()
     : AudioProcessor (BusesProperties()
           .withOutput ("Output", juce::AudioChannelSet::stereo(), true))
 {
     formatManager_.registerBasicFormats();
-
-    // ── Register all parameters ───────────────────────────────────────────────
-    // IDs are written into DAW project files — never rename them!
-    // Sequencer
-    addParameter (seqSteps    = new juce::AudioParameterInt   ("seqSteps",    "Steps",    1,  32, 16));
-    addParameter (seqHits     = new juce::AudioParameterInt   ("seqHits",     "Hits",     0,  32,  4));
-    addParameter (seqRotation = new juce::AudioParameterInt   ("seqRotation", "Rotation", 0,  31,  0));
-    addParameter (seqRate     = new juce::AudioParameterFloat ("seqRate",     "Rate",
-                                    juce::NormalisableRange<float> (0.25f, 4.0f, 0.0f, 0.5f), 1.0f));
-    addParameter (sampleGain  = new juce::AudioParameterFloat ("sampleGain",  "Gain",     0.0f, 2.0f, 1.0f));
-
-    // Pitch
-    addParameter (pitch = new juce::AudioParameterFloat ("pitch", "Pitch",
-                              juce::NormalisableRange<float> (-24.0f, 24.0f, 0.01f), 0.0f));
-
-    // ADSR — use logarithmic skew so short times have finer resolution
-    auto logRange = [] (float mn, float mx) {
-        return juce::NormalisableRange<float> (mn, mx, 0.0f, 0.3f);
-    };
-    addParameter (attack  = new juce::AudioParameterFloat ("attack",  "Attack",  logRange (0.001f, 2.0f), 0.005f));
-    addParameter (decay   = new juce::AudioParameterFloat ("decay",   "Decay",   logRange (0.001f, 2.0f), 0.1f));
-    addParameter (sustain = new juce::AudioParameterFloat ("sustain", "Sustain", { 0.0f, 1.0f },          0.8f));
-    addParameter (release = new juce::AudioParameterFloat ("release", "Release", logRange (0.001f, 4.0f), 0.2f));
-
-    // Filter — frequency with strong log skew so low end isn't crammed in 5%
-    addParameter (filterFreq = new juce::AudioParameterFloat ("filterFreq", "Filter Freq",
-                                   juce::NormalisableRange<float> (20.0f, 20000.0f, 0.0f, 0.25f), 20000.0f));
-    addParameter (filterRes  = new juce::AudioParameterFloat ("filterRes",  "Filter Res",
-                                   { 0.5f, 10.0f }, 0.707f));
-
-    // Distortion + Reverb
-    addParameter (distDrive    = new juce::AudioParameterFloat ("distDrive",    "Drive",      { 0.0f, 1.0f }, 0.0f));
-    addParameter (reverbMix    = new juce::AudioParameterFloat ("reverbMix",    "Reverb Mix", { 0.0f, 1.0f }, 0.0f));
-    addParameter (reverbSize   = new juce::AudioParameterFloat ("reverbSize",   "Room Size",  { 0.0f, 1.0f }, 0.5f));
-    addParameter (reverbFreeze = new juce::AudioParameterBool  ("reverbFreeze", "Freeze",     false));
-
-    // Sample advance mode
-    addParameter (sampleAdvanceMode = new juce::AudioParameterInt ("sampleAdv", "Sample Mode", 0, 2, 0));
-
-    // Set initial sequencer pattern
-    sequencer.set (16, 4, 0);
+    addParameter (bpm = new juce::AudioParameterFloat ("g_bpm", "BPM",
+                             juce::NormalisableRange<float> (20.0f, 999.0f, 0.01f, 0.5f), 120.0f));
+    // clkDiv: beats per phasor cycle. 1=beat, 2=half-bar, 4=1bar, 8=2bars.
+    addParameter (clkDiv = new juce::AudioParameterInt ("g_clkDiv", "Beats/Cycle", 1, 8, 4));
+    for (int i = 0; i < 3; ++i) voiceMuted_[i].store (false);
+    registerVoiceParams (0, "v0_");
+    registerVoiceParams (1, "v1_");
+    registerVoiceParams (2, "v2_");
 }
 
 W2SamplerProcessor::~W2SamplerProcessor() {}
@@ -56,26 +81,13 @@ W2SamplerProcessor::~W2SamplerProcessor() {}
 void W2SamplerProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     sampleRate_ = sampleRate;
-    stepPhase_  = 0.0;
-    sequencer.reset();
-
-    // Invalidate all caches so first processBlock does a full rebuild
-    lastSteps_ = lastHits_ = lastRotation_ = -1;
-    lastRate_ = lastPitch_ = lastAttack_ = lastDecay_ = -1.0f;
-    lastSustain_ = lastRelease_ = lastFilterFreq_ = lastFilterRes_ = -1.0f;
-    lastDistDrive_ = lastReverbMix_ = lastReverbSize_ = -1.0f;
-    lastReverbFreeze_ = false;
-
-    // Prepare the DSP voice (filter, reverb, ADSR) for this sample rate/block size
-    voice.prepare (sampleRate, samplesPerBlock);
-
-    rebuildSequencerIfNeeded();
+    clock_.prepare (sampleRate);
+    clock_.reset();
+    clock_.setBPM (bpm ? (double) bpm->get() : 120.0);
+    for (int v = 0; v < 3; ++v)
+        voices_[v].prepare (sampleRate, samplesPerBlock);
 }
 
-void W2SamplerProcessor::releaseResources() {}
-
-//==============================================================================
-// processBlock — THE HOT PATH. Audio thread. ~100x/sec. No alloc, no I/O.
 //==============================================================================
 void W2SamplerProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                                         juce::MidiBuffer& midi)
@@ -83,315 +95,236 @@ void W2SamplerProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     juce::ScopedNoDenormals noDenormals;
     buffer.clear();
 
-    // Rebuild sequencer pattern if steps/hits/rotation/rate changed
-    rebuildSequencerIfNeeded();
+    if (!isPlaying_.load()) { midi.clear(); return; }
 
-    // Build the voice params struct from current parameter values
-    W2SamplerVoice::Params vp;
-    rebuildVoiceParamsIfNeeded (vp);
+    clock_.setBPM (bpm ? (double) bpm->get() : 120.0);
+    clock_.beatsPerCycle = clkDiv ? (double) clkDiv->get() : 4.0;
 
     int numSamples = buffer.getNumSamples();
+    double masterPhase = clock_.phaseAfter (numSamples);
+    clock_.phase = masterPhase;
 
-    // Advance the internal clock — fires sequencer ticks and voice triggers
-    if (isPlaying_.load())
-        advanceClock (numSamples);
+    // Determine effective mute per voice (mute overrides solo; solo mutes others)
+    int  solo     = soloVoice_.load();
+    bool anySolo  = (solo >= 0 && solo < 3);
 
-    // Render the sample voice (with all DSP) into the output buffer
-    if (voice.isPlaying())
-        voice.renderBlock (buffer, 0, numSamples, sampleRate_, vp);
-
-    // Handle MIDI note-on (manual keyboard trigger, bypasses sequencer)
-    for (const auto meta : midi)
+    VoiceChannel::Params vcp;
+    for (int v = 0; v < 3; ++v)
     {
-        auto msg = meta.getMessage();
-        if (msg.isNoteOn())
-            voice.trigger (msg.getFloatVelocity());
+        bool muted = voiceMuted_[v].load() || (anySolo && solo != v);
+        voices_[v].setMuted (muted);
+
+        fillVoiceParams (v, vcp);
+        double inputPhase = selectInputPhase (v, masterPhase);
+        voices_[v].processBlock (inputPhase, vcp, buffer, 0, numSamples);
     }
+
     midi.clear();
 }
 
 //==============================================================================
-// advanceClock — sample-accurate clock; fires sequencer ticks at step boundaries
-//==============================================================================
-void W2SamplerProcessor::advanceClock (int numSamples)
+double W2SamplerProcessor::selectInputPhase (int v, double masterPhase) const
 {
-    if (samplesPerStep_ <= 0.0) return;
-
-    int advMode = sampleAdvanceMode->get();
-
-    for (int i = 0; i < numSamples; ++i)
-    {
-        stepPhase_ += 1.0;
-
-        if (stepPhase_ >= samplesPerStep_)
-        {
-            stepPhase_ -= samplesPerStep_;  // wrap (preserves fractional overshoot)
-
-            bool hit = sequencer.tick();
-            if (hit)
-            {
-                // ── Sample advance on hit ─────────────────────────────────────
-                // This is the "sample changer" feature: each hit can pull a new
-                // sample from the library. No file I/O — just pointer swap.
-                if (advMode == 1 && library_.getCount() > 1)
-                {
-                    // Sequential: advance to next file in folder
-                    int idx = library_.advanceNext();
-                    auto* e = library_.getEntry (idx);
-                    if (e != nullptr)
-                        voice.swapBuffer (&e->buffer, e->sampleRate);
-                }
-                else if (advMode == 2 && library_.getCount() > 1)
-                {
-                    // Random: pick any file from the folder
-                    int idx = library_.advanceRandom (audioRng_);
-                    auto* e = library_.getEntry (idx);
-                    if (e != nullptr)
-                        voice.swapBuffer (&e->buffer, e->sampleRate);
-                }
-
-                voice.trigger (1.0f);
-            }
-        }
-    }
+    int src = vp[v].phaseSource ? vp[v].phaseSource->get() : 0;
+    if (src == 1) return voices_[0].getTransformedPhase();
+    if (src == 2) return voices_[1].getTransformedPhase();
+    if (src == 3) return voices_[2].getTransformedPhase();
+    return masterPhase;
 }
 
 //==============================================================================
-// rebuildSequencerIfNeeded — only calls sequencer.set() when params changed
-//==============================================================================
-void W2SamplerProcessor::rebuildSequencerIfNeeded()
+void W2SamplerProcessor::fillVoiceParams (int v, VoiceChannel::Params& out) const
 {
-    int   steps    = seqSteps->get();
-    int   hits     = seqHits->get();
-    int   rotation = seqRotation->get();
-    float rate     = seqRate->get();
+    const auto& p = vp[v];
+    if (!p.phaseSource) return;
 
-    if (steps != lastSteps_ || hits != lastHits_ || rotation != lastRotation_)
-    {
-        sequencer.set (steps, hits, rotation);
-        lastSteps_ = steps; lastHits_ = hits; lastRotation_ = rotation;
-    }
+    out.phaseSource    = static_cast<VoiceChannel::PhaseSource> (p.phaseSource->get());
+    out.rate           = p.rate->get();
+    out.phaseOffset    = p.phaseOffset->get();
+    out.warp           = p.warp->get();
+    out.reverse        = p.reverse->get();
+    out.quantiseAmount = p.quantiseAmt->get();
+    out.seqSteps       = p.seqSteps->get();
+    out.seqHits        = p.seqHits->get();
+    out.seqRotation    = p.seqRotation->get();
+    out.sampleAdvance  = static_cast<VoiceChannel::SampleAdvMode> (p.sampleAdv->get());
+    out.rndFxChance    = p.rndFxChance->get();
 
-    if (std::abs (rate - lastRate_) > 1e-6f)
-    {
-        // Convert BPM + rate to samples/step
-        // TODO: replace hardcoded 120 with host BPM from AudioPlayHead
-        double bpm         = 120.0;
-        samplesPerStep_    = sampleRate_ * (60.0 / bpm) / (double) rate;
-        lastRate_          = rate;
-    }
+    auto& g = out.granular;
+    g.pitchSemitones = p.pitch->get();
+    g.attackSec      = p.attack->get();
+    g.decaySec       = p.decay->get();
+    g.sustain        = p.sustain->get();
+    g.releaseSec     = p.release->get();
+    g.filterFreqHz   = p.filterFreq->get();
+    g.filterRes      = p.filterRes->get();
+    g.distDrive      = p.distDrive->get();
+    g.reverbMix      = p.reverbMix->get();
+    g.reverbSize     = p.reverbSize->get();
+    g.reverbFreeze   = p.reverbFreeze->get();
+    g.gain           = p.gain->get();
+    g.regionStart    = p.regionStart->get();
+    g.regionEnd      = p.regionEnd->get();
+    g.loopMode       = static_cast<GranularVoice::LoopMode> (p.loopMode->get());
+    g.loopStart      = p.loopStart->get();
+    g.loopEnd        = p.loopEnd->get();
+    g.loopSizeMs     = p.loopSizeMs->get();
+    g.loopSizeLock   = p.loopSizeLock->get();
 }
 
 //==============================================================================
-// rebuildVoiceParamsIfNeeded — fills the Params struct; updates caches if changed
+// Message-thread API
 //==============================================================================
-void W2SamplerProcessor::rebuildVoiceParamsIfNeeded (W2SamplerVoice::Params& p)
+void W2SamplerProcessor::loadFolder (int v, const juce::File& folder)
 {
-    // Always fill the struct from current param values
-    p.pitchSemitones = pitch->get();
-    p.attackSec      = attack->get();
-    p.decaySec       = decay->get();
-    p.sustain        = sustain->get();
-    p.releaseSec     = release->get();
-    p.filterFreqHz   = filterFreq->get();
-    p.filterRes      = filterRes->get();
-    p.distDrive      = distDrive->get();
-    p.reverbMix      = reverbMix->get();
-    p.reverbSize     = reverbSize->get();
-    p.reverbFreeze   = reverbFreeze->get();
-    p.gain           = sampleGain->get();
-    // (Voice reads these from the struct in renderBlock — no separate cache needed here)
+    if (v < 0 || v > 2) return;
+    voices_[v].loadFolder (folder, formatManager_);
+    voices_[v].getLibrary().analyseAllOnsets (0.5f);
 }
 
-//==============================================================================
-// File / library management (MESSAGE THREAD)
-//==============================================================================
-void W2SamplerProcessor::loadFolder (const juce::File& folder)
+void W2SamplerProcessor::prevSample   (int v) { if (v>=0&&v<3) voices_[v].prevSample(); }
+void W2SamplerProcessor::nextSample   (int v) { if (v>=0&&v<3) voices_[v].nextSample(); }
+void W2SamplerProcessor::randomSample (int v) { if (v>=0&&v<3) voices_[v].randomSample(); }
+
+void W2SamplerProcessor::randomizeVoiceParams (int v)
 {
-    // Pre-load all samples from the folder into memory.
-    // This decodes audio on the message thread — can take a moment for large folders.
-    int n = library_.loadFolder (folder, formatManager_);
-    juce::ignoreUnused (n);
-
-    // Load the first sample into the voice
-    loadCurrentSample();
-}
-
-void W2SamplerProcessor::prevSample()
-{
-    library_.prev();
-    loadCurrentSample();
-}
-
-void W2SamplerProcessor::nextSample()
-{
-    library_.next();
-    loadCurrentSample();
-}
-
-void W2SamplerProcessor::randomSample()
-{
-    library_.pickRandom();
-    loadCurrentSample();
-}
-
-void W2SamplerProcessor::loadCurrentSample()
-{
-    auto* e = library_.current();
-    if (e == nullptr) return;
-
-    // loadBuffer is a message-thread operation — stop the voice first to avoid
-    // the audio thread reading a half-swapped pointer (see ARCHITECTURE.md §13)
-    voice.stop();
-    voice.loadBuffer (&e->buffer, e->sampleRate);
-}
-
-bool W2SamplerProcessor::hasSample() const
-{
-    return library_.current() != nullptr;
-}
-
-const juce::AudioBuffer<float>* W2SamplerProcessor::getCurrentSampleBuffer() const
-{
-    auto* e = library_.current();
-    return e ? &e->buffer : nullptr;
-}
-
-//==============================================================================
-// Voice params randomize (MESSAGE THREAD — AudioParameter::operator= is atomic)
-//==============================================================================
-void W2SamplerProcessor::randomizeVoiceParams()
-{
+    if (v < 0 || v > 2) return;
+    auto& p   = vp[v];
     auto& rng = juce::Random::getSystemRandom();
-    *pitch       = rng.nextFloat() * 24.0f - 12.0f;         // -12 to +12 semitones
-    *attack      = 0.001f + rng.nextFloat() * 0.499f;        // 1ms – 500ms
-    *decay       = 0.01f  + rng.nextFloat() * 0.490f;        // 10ms – 500ms
-    *sustain     = 0.3f   + rng.nextFloat() * 0.7f;          // 30% – 100%
-    *release     = 0.05f  + rng.nextFloat() * 0.950f;        // 50ms – 1s
-    *filterFreq  = 200.0f + rng.nextFloat() * 15800.0f;      // 200Hz – 16kHz
-    *filterRes   = 0.5f   + rng.nextFloat() * 3.0f;          // 0.5 – 3.5
-    *distDrive   = rng.nextFloat() * 0.6f;                   // 0% – 60%
-    *reverbMix   = rng.nextFloat() * 0.7f;                   // 0% – 70%
-    *reverbSize  = 0.2f   + rng.nextFloat() * 0.8f;          // 20% – 100%
-    // Leave: sampleGain, reverbFreeze, all seq params
+    *p.pitch       = rng.nextFloat() * 24.0f - 12.0f;
+    *p.attack      = 0.001f + rng.nextFloat() * 0.499f;
+    *p.decay       = 0.01f  + rng.nextFloat() * 0.490f;
+    *p.sustain     = 0.3f   + rng.nextFloat() * 0.7f;
+    *p.release     = 0.05f  + rng.nextFloat() * 0.950f;
+    *p.filterFreq  = 200.0f + rng.nextFloat() * 15800.0f;
+    *p.filterRes   = 0.5f   + rng.nextFloat() * 3.0f;
+    *p.distDrive   = rng.nextFloat() * 0.6f;
+    *p.reverbMix   = rng.nextFloat() * 0.7f;
+    *p.reverbSize  = 0.2f   + rng.nextFloat() * 0.8f;
 }
 
-//==============================================================================
-// Transport
-//==============================================================================
-void W2SamplerProcessor::setPlaying (bool shouldPlay)
+void W2SamplerProcessor::checkAndFireRandomizations()
 {
-    if (!shouldPlay)
-    {
-        stepPhase_ = 0.0;
-        sequencer.reset();
-        voice.stop();
-    }
-    isPlaying_.store (shouldPlay);
+    for (int v = 0; v < 3; ++v)
+        if (voices_[v].takeRandomizeFXRequest())
+            randomizeVoiceParams (v);
 }
 
-bool W2SamplerProcessor::getPlaying() const { return isPlaying_.load(); }
-
 //==============================================================================
-// UI accessors
-//==============================================================================
-std::vector<bool> W2SamplerProcessor::getCurrentPattern() const
+void W2SamplerProcessor::setPlaying (bool p)
 {
-    return sequencer.getPattern();
+    if (!p) clock_.reset();
+    isPlaying_.store (p);
 }
 
-int W2SamplerProcessor::getCurrentStep() const { return sequencer.getStep(); }
-
-//==============================================================================
-// Editor factory
-//==============================================================================
-juce::AudioProcessorEditor* W2SamplerProcessor::createEditor()
+void W2SamplerProcessor::setVoiceMute (int v, bool muted)
 {
-    return new W2SamplerEditor (*this);
+    if (v >= 0 && v < 3) voiceMuted_[v].store (muted);
+}
+
+void W2SamplerProcessor::setVoiceSolo (int v)
+{
+    // v == -1 clears solo; v == current solo also clears (toggle)
+    int cur = soloVoice_.load();
+    soloVoice_.store ((cur == v) ? -1 : v);
 }
 
 //==============================================================================
-// State save / load — version 2 format
-// Byte 0 = version marker (2)
-// Followed by: 5 original params + 11 new params + 1 advance mode = 17 values
+// State v3 (Phase 1 format)
 //==============================================================================
 void W2SamplerProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     juce::MemoryOutputStream s (destData, true);
-    s.writeByte (2);  // version marker
-    // Sequencer (5)
-    s.writeInt   (seqSteps->get());
-    s.writeInt   (seqHits->get());
-    s.writeInt   (seqRotation->get());
-    s.writeFloat (seqRate->get());
-    s.writeFloat (sampleGain->get());
-    // Voice (11)
-    s.writeFloat (pitch->get());
-    s.writeFloat (attack->get());
-    s.writeFloat (decay->get());
-    s.writeFloat (sustain->get());
-    s.writeFloat (release->get());
-    s.writeFloat (filterFreq->get());
-    s.writeFloat (filterRes->get());
-    s.writeFloat (distDrive->get());
-    s.writeFloat (reverbMix->get());
-    s.writeFloat (reverbSize->get());
-    s.writeBool  (reverbFreeze->get());
-    // Mode (1)
-    s.writeInt   (sampleAdvanceMode->get());
+    s.writeByte (4);
+    s.writeFloat (bpm->get());
+    s.writeInt   (clkDiv->get());
+    for (int v = 0; v < 3; ++v)
+    {
+        const auto& p = vp[v];
+        s.writeInt   (p.phaseSource->get());
+        s.writeFloat (p.rate->get());
+        s.writeFloat (p.phaseOffset->get());
+        s.writeFloat (p.warp->get());
+        s.writeBool  (p.reverse->get());
+        s.writeFloat (p.quantiseAmt->get());
+        s.writeInt   (p.seqSteps->get());
+        s.writeInt   (p.seqHits->get());
+        s.writeInt   (p.seqRotation->get());
+        s.writeInt   (p.sampleAdv->get());
+        s.writeFloat (p.rndFxChance->get());
+        s.writeFloat (p.pitch->get());
+        s.writeFloat (p.attack->get());
+        s.writeFloat (p.decay->get());
+        s.writeFloat (p.sustain->get());
+        s.writeFloat (p.release->get());
+        s.writeFloat (p.filterFreq->get());
+        s.writeFloat (p.filterRes->get());
+        s.writeFloat (p.distDrive->get());
+        s.writeFloat (p.reverbMix->get());
+        s.writeFloat (p.reverbSize->get());
+        s.writeBool  (p.reverbFreeze->get());
+        s.writeFloat (p.gain->get());
+        s.writeFloat (p.regionStart->get());
+        s.writeFloat (p.regionEnd->get());
+        s.writeInt   (p.loopMode->get());
+        s.writeFloat (p.loopStart->get());
+        s.writeFloat (p.loopEnd->get());
+        s.writeFloat (p.loopSizeMs->get());
+        s.writeBool  (p.loopSizeLock->get());
+    }
 }
 
 void W2SamplerProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
     juce::MemoryInputStream s (data, (size_t) sizeInBytes, false);
     if (s.getNumBytesRemaining() < 1) return;
-
-    int8_t version = s.readByte();
-
-    if (version == 2)
+    if (s.readByte() != 4) return;  // discard older formats
+    if (s.getNumBytesRemaining() < 4) return;
+    *bpm    = s.readFloat();
+    *clkDiv = s.readInt();
+    for (int v = 0; v < 3; ++v)
     {
-        // Full v2 state
-        if (s.getNumBytesRemaining() < 20) return;
-        *seqSteps    = s.readInt();
-        *seqHits     = s.readInt();
-        *seqRotation = s.readInt();
-        *seqRate     = s.readFloat();
-        *sampleGain  = s.readFloat();
-
-        if (s.getNumBytesRemaining() < 44) return;
-        *pitch       = s.readFloat();
-        *attack      = s.readFloat();
-        *decay       = s.readFloat();
-        *sustain     = s.readFloat();
-        *release     = s.readFloat();
-        *filterFreq  = s.readFloat();
-        *filterRes   = s.readFloat();
-        *distDrive   = s.readFloat();
-        *reverbMix   = s.readFloat();
-        *reverbSize  = s.readFloat();
-        *reverbFreeze = s.readBool();
-        *sampleAdvanceMode = s.readInt();
-    }
-    else
-    {
-        // v1 compat: the 'version' byte was actually the first byte of seqSteps int
-        // Reconstruct the int from that byte + 3 more bytes
-        int steps = (int) ((uint8_t) version);
-        if (s.getNumBytesRemaining() < 3) return;
-        // Read the remaining 3 bytes of the int (little-endian)
-        steps |= ((int) s.readByte()) << 8;
-        steps |= ((int) s.readByte()) << 16;
-        steps |= ((int) s.readByte()) << 24;
-        *seqSteps = steps;
-        if (s.getNumBytesRemaining() < 16) return;
-        *seqHits     = s.readInt();
-        *seqRotation = s.readInt();
-        *seqRate     = s.readFloat();
-        *sampleGain  = s.readFloat();
+        auto& p = vp[v];
+        if (s.getNumBytesRemaining() < 4) return;
+        *p.phaseSource  = s.readInt();
+        *p.rate         = s.readFloat();
+        *p.phaseOffset  = s.readFloat();
+        *p.warp         = s.readFloat();
+        *p.reverse      = s.readBool();
+        *p.quantiseAmt  = s.readFloat();
+        *p.seqSteps     = s.readInt();
+        *p.seqHits      = s.readInt();
+        *p.seqRotation  = s.readInt();
+        *p.sampleAdv    = s.readInt();
+        *p.rndFxChance  = s.readFloat();
+        *p.pitch        = s.readFloat();
+        *p.attack       = s.readFloat();
+        *p.decay        = s.readFloat();
+        *p.sustain      = s.readFloat();
+        *p.release      = s.readFloat();
+        *p.filterFreq   = s.readFloat();
+        *p.filterRes    = s.readFloat();
+        *p.distDrive    = s.readFloat();
+        *p.reverbMix    = s.readFloat();
+        *p.reverbSize   = s.readFloat();
+        *p.reverbFreeze = s.readBool();
+        *p.gain         = s.readFloat();
+        *p.regionStart  = s.readFloat();
+        *p.regionEnd    = s.readFloat();
+        *p.loopMode     = s.readInt();
+        *p.loopStart    = s.readFloat();
+        *p.loopEnd      = s.readFloat();
+        *p.loopSizeMs   = s.readFloat();
+        *p.loopSizeLock = s.readBool();
     }
 }
 
 //==============================================================================
+juce::AudioProcessorEditor* W2SamplerProcessor::createEditor()
+{
+    return new W2SamplerEditor (*this);
+}
+
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
     return new W2SamplerProcessor();
