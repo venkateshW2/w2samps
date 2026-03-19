@@ -462,54 +462,64 @@ LCG RNG (`audioRng_`) used on audio thread (no shared state).
 
 ### Phase 1 — Phasor Clock + 3 Voices + Granular (CURRENT)
 
-#### 1.1 MasterClock
+#### 1.1 MasterClock ✓
 
-- [ ] `src/MasterClock.h` — phasor tick, BPM param, host sync stub
-- [ ] Wire into PluginProcessor, replace old sample-counter clock
-- [ ] BPM knob in Master tab
+- [x] `src/MasterClock.h` — phasor tick, beatsPerCycle (default 4=1 bar)
+- [x] `clkDiv` AudioParameter (1–8 beats/cycle), buttons [1 Beat][2 Beats][4=Bar][8=2Bar]
+- [x] Wire into PluginProcessor, replace old sample-counter clock
+- [x] BPM knob + cycle div buttons in Master tab global bar
 
-#### 1.2 Phase Manipulation
+#### 1.2 Phase Manipulation ✓
 
-- [ ] `src/PhaseTransform.h` — rate, offset, warp, reverse, step-quantise functions
-- [ ] Per-voice params: rateMultiplier, phaseOffset, warp, reverse
-- [ ] Inter-voice: phaseSource (Master/LockV1/LockV2/RatioV1/RatioV2) + ratioN/D
-- [ ] Phase visualiser on Master tab (3 dots on circle showing current positions)
+- [x] `src/PhaseTransform.h` — rate × offset × warp × reverse × step-quantise
+- [x] Per-voice params: rateMultiplier (/8…×8), phaseOffset, warp, reverse
+- [x] Inter-voice: phaseSource (Master/LockV1/LockV2/RatioV1/RatioV2) + ratioN/D
+- [ ] Phase visualiser on Master tab (3 dots on circle) — deferred to UI polish pass
 
-#### 1.3 Polyrhythm Sequencer
+#### 1.3 Polyrhythm Sequencer ✓
 
-- [ ] Replace seqRate with loopNumerator + loopDenominator per voice
-- [ ] Step-fire logic: `floor(transformedPhase × steps / loopBeats) % steps`
-- [ ] Euclidean pattern per voice (steps, hits, rotation)
+- [x] loopNumerator + loopDenominator per voice (seqRate deprecated)
+- [x] Step-fire logic: `floor(transformedPhase × steps / loopBeats) % steps`
+- [x] Euclidean pattern per voice (steps, hits, rotation)
 
-#### 1.4 Three VoiceChannels
+#### 1.4 Three VoiceChannels ✓
 
-- [ ] `src/VoiceChannel.h` — owns library + voice + sequencer state
-- [ ] PluginProcessor holds `VoiceChannel voices[3]`
-- [ ] Per-voice params with `v0_`, `v1_`, `v2_` prefix
-- [ ] Per-voice gain, pan, level to output mix
+- [x] `src/VoiceChannel.h` — owns library + voice + sequencer state
+- [x] PluginProcessor holds `VoiceChannel voices[3]`
+- [x] Per-voice params with `v0_`, `v1_`, `v2_` prefix
+- [x] Per-voice gain, mute, solo
 
-#### 1.5 GranularVoice
+#### 1.5 GranularVoice ✓
 
-- [ ] `src/GranularVoice.h` — replaces SamplerVoice
-- [ ] Region params: regionStart, regionEnd, loopStart, loopEnd (all 0–1)
-- [ ] Loop modes: Off / Fixed / Random / Sequential
-- [ ] Loop size lock: fixed ms, slides position knob
-- [ ] Same DSP chain (ADSR + distortion + filter + reverb)
+- [x] `src/GranularVoice.h` — replaces SamplerVoice
+- [x] Region + loop params: all absolute [0,1] of full buffer
+- [x] Loop modes: Off / Fixed / Random / Sequential
+- [x] Loop size lock (fixed ms, position knob slides window)
+- [x] Same DSP chain (ADSR + distortion + filter + reverb)
 
-#### 1.6 Onset Detection
+#### 1.6 Onset Detection ✓
 
-- [ ] `src/OnsetDetector.h` — spectral flux onset detection
-- [ ] Run on load in SampleLibrary::loadFolder
-- [ ] Store onset positions + estimated BPM in SampleLibrary::Entry
-- [ ] Display onset ticks on waveform in editor
-- [ ] Snap region handles to onsets
+- [x] `src/OnsetDetector.h` — spectral flux (512-sample STFT, 256 hop)
+- [x] Runs offline on load; stores normalised onset positions + estimated BPM
+- [x] Onset count + estimated BPM shown in waveform info bar
+- [ ] Display onset ticks as marks on waveform — next pass
+- [ ] Snap region/loop handles to nearest onset — next pass
 
-#### 1.7 Tabbed UI
+#### 1.7 Tabbed UI ✓
 
-- [ ] Custom tab strip: [Master] [Voice 1] [Voice 2] [Voice 3]
-- [ ] Master tab: BPM, play/stop, global level, phase circle visualiser
-- [ ] Voice tabs: waveform + region, loop controls, ADSR+FX, seq params, phase params
-- [ ] Window: 700 × 500 px
+- [x] Custom tab strip: [Master] [Voice 1] [Voice 2] [Voice 3]
+- [x] Active tab: kActive (light green) fill + 3px bottom border
+- [x] Master tab: BPM, play/stop, cycle div, mute/solo in always-visible global bar
+- [x] Voice tabs: waveform, loop controls, ADSR+FX, seq, phase params
+- [x] Window: 820 × 620 px
+
+#### 1.8 Waveform / Loop Fixes (2026-03-19)
+
+- [x] Loop handles (blue) always visible regardless of loop mode (incl. Off)
+- [x] Loop window blue shading: Off/Fixed uses handle positions; Rnd/Seq follows seqLoopAnchor
+- [x] Coordinate system locked: loopStart/loopEnd are absolute [0,1] of full buffer
+- [x] Loop handles draggable in all modes (removed loopMode != 0 guard in findHandle)
+- [x] Active tab indicator: distinct color + 3px bottom border
 
 ### Phase 2 — Preset Snapshot System
 
