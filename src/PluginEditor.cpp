@@ -170,19 +170,19 @@ void W2SamplerEditor::buildVoiceUI (int v)
     auto& p  = proc.vp[v];
 
     // Section header buttons — children of leftContent_
-    static const char* secNames[] = { "SAMPLE", "SEQUENCE", "PHASE", "SOUND", "FX / PRESETS" };
-    for (int s = 0; s < 5; ++s)
+    static const char* secNames[] = { "SAMPLE", "SEQUENCE", "PHASE", "SOUND", "FX / PRESETS", "MODULATION" };
+    for (int s = 0; s < 6; ++s)
     {
         ui.sectionBtn[s].setButtonText ((ui.sectionOpen[s] ? juce::String (L"\u25BC ") : juce::String (L"\u25BA ")) + secNames[s]);
         styleButton (ui.sectionBtn[s]);
         ui.sectionBtn[s].onClick = [this, v, s] {
             voiceUI[v].sectionOpen[s] = !voiceUI[v].sectionOpen[s];
-            const char* names[] = { "SAMPLE", "SEQUENCE", "PHASE", "SOUND", "FX / PRESETS" };
+            const char* names[] = { "SAMPLE", "SEQUENCE", "PHASE", "SOUND", "FX / PRESETS", "MODULATION" };
             voiceUI[v].sectionBtn[s].setButtonText (
                 (voiceUI[v].sectionOpen[s] ? juce::String (L"\u25BC ") : juce::String (L"\u25BA ")) + names[s]);
             resized();
         };
-        leftContent_.addAndMakeVisible (ui.sectionBtn[s]);
+        if (s != 4) leftContent_.addAndMakeVisible (ui.sectionBtn[s]);  // 4=FX bottom bar
     }
 
     // Nav
@@ -461,6 +461,77 @@ void W2SamplerEditor::buildVoiceUI (int v)
         addAndMakeVisible (ui.presetBtns[s]);
     }
 
+    // Modulation section (section 5)
+    for (int fg = 0; fg < VoiceUI::kNumFg; ++fg)
+    {
+        // Canvas
+        ui.fgCanvas[fg].setFuncGen (&proc.getVoiceFuncGen (v, fg));
+        ui.fgCanvas[fg].onChange = [this] { repaint(); };
+        leftContent_.addAndMakeVisible (ui.fgCanvas[fg]);
+
+        // Rate cycling button
+        ui.fgRateBtn[fg].setButtonText (kFgRateNames[proc.vp[v].fgRate[fg] ? proc.vp[v].fgRate[fg]->get() : 4]);
+        styleButton (ui.fgRateBtn[fg]);
+        ui.fgRateBtn[fg].onClick = [this, v, fg] {
+            if (!proc.vp[v].fgRate[fg]) return;
+            int next = (proc.vp[v].fgRate[fg]->get() + 1) % kNumFgRates;
+            *proc.vp[v].fgRate[fg] = next;
+            voiceUI[v].fgRateBtn[fg].setButtonText (kFgRateNames[next]);
+        };
+        leftContent_.addAndMakeVisible (ui.fgRateBtn[fg]);
+
+        // Destination cycling button
+        int curDest = proc.vp[v].fgDest[fg] ? proc.vp[v].fgDest[fg]->get() : 0;
+        ui.fgDestBtn[fg].setButtonText (kModDestNames[curDest]);
+        styleButton (ui.fgDestBtn[fg]);
+        ui.fgDestBtn[fg].onClick = [this, v, fg] {
+            if (!proc.vp[v].fgDest[fg]) return;
+            int next = (proc.vp[v].fgDest[fg]->get() + 1) % kNumModDests;
+            *proc.vp[v].fgDest[fg] = next;
+            voiceUI[v].fgDestBtn[fg].setButtonText (kModDestNames[next]);
+        };
+        leftContent_.addAndMakeVisible (ui.fgDestBtn[fg]);
+
+        // Depth slider
+        styleSlider (ui.fgDepthSlider[fg], -1.0f, 1.0f,
+                     proc.vp[v].fgDepth[fg] ? proc.vp[v].fgDepth[fg]->get() : 0.0f);
+        ui.fgDepthSlider[fg].setDoubleClickReturnValue (true, 0.0);
+        ui.fgDepthSlider[fg].onValueChange = [this, v, fg] {
+            if (proc.vp[v].fgDepth[fg])
+                *proc.vp[v].fgDepth[fg] = (float) voiceUI[v].fgDepthSlider[fg].getValue();
+        };
+        ui.fgDepthLabel[fg].setText ("Depth", juce::dontSendNotification);
+        styleLabel (ui.fgDepthLabel[fg]);
+        leftContent_.addAndMakeVisible (ui.fgDepthSlider[fg]);
+        leftContent_.addAndMakeVisible (ui.fgDepthLabel[fg]);
+
+        // Min slider
+        styleSlider (ui.fgMinSlider[fg], 0.0f, 1.0f,
+                     proc.vp[v].fgMin[fg] ? proc.vp[v].fgMin[fg]->get() : 0.0f);
+        ui.fgMinSlider[fg].setDoubleClickReturnValue (true, 0.0);
+        ui.fgMinSlider[fg].onValueChange = [this, v, fg] {
+            if (proc.vp[v].fgMin[fg])
+                *proc.vp[v].fgMin[fg] = (float) voiceUI[v].fgMinSlider[fg].getValue();
+        };
+        ui.fgMinLabel[fg].setText ("Min", juce::dontSendNotification);
+        styleLabel (ui.fgMinLabel[fg]);
+        leftContent_.addAndMakeVisible (ui.fgMinSlider[fg]);
+        leftContent_.addAndMakeVisible (ui.fgMinLabel[fg]);
+
+        // Max slider
+        styleSlider (ui.fgMaxSlider[fg], 0.0f, 1.0f,
+                     proc.vp[v].fgMax[fg] ? proc.vp[v].fgMax[fg]->get() : 1.0f);
+        ui.fgMaxSlider[fg].setDoubleClickReturnValue (true, 1.0);
+        ui.fgMaxSlider[fg].onValueChange = [this, v, fg] {
+            if (proc.vp[v].fgMax[fg])
+                *proc.vp[v].fgMax[fg] = (float) voiceUI[v].fgMaxSlider[fg].getValue();
+        };
+        ui.fgMaxLabel[fg].setText ("Max", juce::dontSendNotification);
+        styleLabel (ui.fgMaxLabel[fg]);
+        leftContent_.addAndMakeVisible (ui.fgMaxSlider[fg]);
+        leftContent_.addAndMakeVisible (ui.fgMaxLabel[fg]);
+    }
+
     updateCycleBtns (v);
 }
 
@@ -635,6 +706,16 @@ void W2SamplerEditor::hideVoiceAll()
         hide (ui.rndFxFireBtn);  hide (ui.resetFxBtn);
         for (auto& b : ui.presetBtns) hide (b);
         hide (ui.presetSaveBtn);
+
+        // Modulation section
+        for (int fg = 0; fg < VoiceUI::kNumFg; ++fg)
+        {
+            hide (ui.fgCanvas[fg]);
+            hide (ui.fgRateBtn[fg]);   hide (ui.fgDestBtn[fg]);
+            hide (ui.fgDepthSlider[fg]); hide (ui.fgDepthLabel[fg]);
+            hide (ui.fgMinSlider[fg]);   hide (ui.fgMinLabel[fg]);
+            hide (ui.fgMaxSlider[fg]);   hide (ui.fgMaxLabel[fg]);
+        }
     }
 }
 
@@ -799,6 +880,52 @@ void W2SamplerEditor::layoutVoicePanel (int v)
         placeSliderCell (ui.preGainLabel, ui.preGainSlider, x0, y, cw, rh, lw); y += rh + 2;
         placeSliderCell (ui.gainLabel,    ui.gainSlider,    x0, y, cw, rh, lw); y += rh + 2;
         placeSliderCell (ui.limitLabel,   ui.limitSlider,   x0, y, cw, rh, lw); y += rh + 2;
+        y += sectionGap;
+    }
+
+    //--------------------------------------------------------------------------
+    // Section 5: MODULATION
+    //--------------------------------------------------------------------------
+    showSection (5);
+    if (ui.sectionOpen[5])
+    {
+        const int cw  = panW;
+        const int rh  = 24;
+        const int cvH = 80;   // canvas height
+
+        for (int fg = 0; fg < VoiceUI::kNumFg; ++fg)
+        {
+            // Canvas (full width)
+            ui.fgCanvas[fg].setBounds (x0, y, cw, cvH);
+            ui.fgCanvas[fg].setVisible (true);
+            y += cvH + 2;
+
+            // Row: [Rate 56px] [Dest 106px] [Depth label 38px] [Depth slider fill]
+            const int ratW = 56, desW = 106, dlbW = 38;
+            ui.fgRateBtn[fg].setBounds   (x0,                     y, ratW,         rh - 2);
+            ui.fgDestBtn[fg].setBounds   (x0 + ratW + 2,          y, desW,         rh - 2);
+            ui.fgDepthLabel[fg].setBounds(x0 + ratW + desW + 4,   y, dlbW,         rh - 2);
+            ui.fgDepthSlider[fg].setBounds(x0 + ratW + desW + dlbW + 4, y,
+                                           cw - ratW - desW - dlbW - 6, rh - 2);
+            ui.fgRateBtn[fg].setVisible  (true);
+            ui.fgDestBtn[fg].setVisible  (true);
+            ui.fgDepthLabel[fg].setVisible(true);
+            ui.fgDepthSlider[fg].setVisible(true);
+            y += rh + 2;
+
+            // Row: [Min label 32px] [Min slider fill/2] [Max label 32px] [Max slider fill/2]
+            const int mnlW = 32;
+            int halfW = (cw - mnlW * 2) / 2;
+            ui.fgMinLabel[fg].setBounds  (x0,                    y, mnlW,  rh - 2);
+            ui.fgMinSlider[fg].setBounds (x0 + mnlW,             y, halfW, rh - 2);
+            ui.fgMaxLabel[fg].setBounds  (x0 + mnlW + halfW + 2, y, mnlW,  rh - 2);
+            ui.fgMaxSlider[fg].setBounds (x0 + mnlW*2 + halfW + 2, y, halfW, rh - 2);
+            ui.fgMinLabel[fg].setVisible (true);
+            ui.fgMinSlider[fg].setVisible(true);
+            ui.fgMaxLabel[fg].setVisible (true);
+            ui.fgMaxSlider[fg].setVisible(true);
+            y += rh + 4;
+        }
         y += sectionGap;
     }
 

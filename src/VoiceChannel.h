@@ -3,6 +3,7 @@
 #include "GranularVoice.h"
 #include "EuclideanSequencer.h"
 #include "PhaseTransform.h"
+#include "FuncGen.h"
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <atomic>
 
@@ -76,6 +77,16 @@ public:
 
         // ── GranularVoice DSP chain ───────────────────────────────────────────
         GranularVoice::Params granular;
+
+        // ── Function generator modulation ────────────────────────────────────
+        // 2 FuncGens per voice. Each has a rate (×master delta), destination,
+        // depth (-1→+1), and min/max range in normalised [0,1] param space.
+        static constexpr int kNumFuncGens = 2;
+        float fgRate[kNumFuncGens]  = { 1.0f, 1.0f };  // multiplier vs master delta
+        int   fgDest[kNumFuncGens]  = { 0, 0 };         // ModDest index
+        float fgDepth[kNumFuncGens] = { 0.0f, 0.0f };   // -1 → +1
+        float fgMin[kNumFuncGens]   = { 0.0f, 0.0f };   // normalised param range lo
+        float fgMax[kNumFuncGens]   = { 1.0f, 1.0f };   // normalised param range hi
     };
 
     //==========================================================================
@@ -85,6 +96,8 @@ public:
         lastInputPhase_   = 0.0;
         voicePhaseAccum_  = 0.0;
         lastTransformedPhase_ = 0.0;
+        for (int i = 0; i < Params::kNumFuncGens; ++i)
+            fgPhaseAccum_[i] = 0.0;
         voice_.prepare (sampleRate, maxBlockSize);
     }
 
@@ -148,8 +161,27 @@ public:
             lastSeqRotation_ = params.seqRotation;
         }
 
+        // ── Accumulate FuncGen phases (independent of voice rate) ────────────
+        for (int i = 0; i < Params::kNumFuncGens; ++i)
+        {
+            fgPhaseAccum_[i] += inputDelta * (double) params.fgRate[i];
+            while (fgPhaseAccum_[i] >= 1.0) fgPhaseAccum_[i] -= 1.0;
+        }
+
         // ── Build mutable granular params (loop anchor may be overridden) ────────
         GranularVoice::Params gran = params.granular;
+
+        // ── Apply FuncGen modulation to gran params ───────────────────────────
+        for (int i = 0; i < Params::kNumFuncGens; ++i)
+        {
+            auto dest = (ModDest) params.fgDest[i];
+            if (dest == ModDest::None || params.fgDepth[i] == 0.0f) continue;
+
+            float raw    = funcGens_[i].evaluate ((float) fgPhaseAccum_[i]);
+            float norm   = params.fgMin[i] + raw * (params.fgMax[i] - params.fgMin[i]);
+            float depth  = params.fgDepth[i];
+            applyModDest (gran, params.granular, dest, norm, depth);
+        }
 
         // ── Find step crossings in [lastPhase, newPhase) ──────────────────────
         int firedSteps[32];
@@ -337,6 +369,10 @@ public:
         return wantsRandomizeFX_.exchange (false);
     }
 
+    // FuncGen access (editor draws + edits curves on message thread)
+    FuncGen&       getFuncGen (int i)       { return funcGens_[(size_t) i]; }
+    const FuncGen& getFuncGen (int i) const { return funcGens_[(size_t) i]; }
+
     //==========================================================================
     // Message-thread navigation
 
@@ -369,14 +405,105 @@ private:
         }
     }
 
+    /** Apply one FuncGen modulation slot to gran params.
+     *  norm   — normalised [0,1] curve output, already scaled by fgMin/fgMax.
+     *  depth  — blend [-1, +1]: how much norm shifts the destination.
+     *  Base   — the original (unmodulated) gran params for blending. */
+    static void applyModDest (GranularVoice::Params& gran,
+                               const GranularVoice::Params& base,
+                               ModDest dest, float norm, float depth) noexcept
+    {
+        auto bl = [] (float a, float b, float t) { return a + (b - a) * t; };
+        auto cl = [] (float v, float lo, float hi)
+                  { return v < lo ? lo : (v > hi ? hi : v); };
+
+        switch (dest)
+        {
+            case ModDest::Pitch:
+            {
+                float target = bl (-24.f, 24.f, norm);
+                gran.pitchSemitones = cl (base.pitchSemitones + (target - base.pitchSemitones) * depth,
+                                         -24.f, 24.f);
+                break;
+            }
+            case ModDest::Attack:
+            {
+                float target = 0.001f + norm * 1.999f;
+                gran.attackSec = cl (base.attackSec + (target - base.attackSec) * depth,
+                                     0.001f, 2.f);
+                break;
+            }
+            case ModDest::Decay:
+            {
+                float target = 0.001f + norm * 1.999f;
+                gran.decaySec = cl (base.decaySec + (target - base.decaySec) * depth,
+                                    0.001f, 2.f);
+                break;
+            }
+            case ModDest::Sustain:
+            {
+                gran.sustain = cl (base.sustain + (norm - base.sustain) * depth, 0.f, 1.f);
+                break;
+            }
+            case ModDest::Release:
+            {
+                float target = 0.001f + norm * 3.999f;
+                gran.releaseSec = cl (base.releaseSec + (target - base.releaseSec) * depth,
+                                      0.001f, 4.f);
+                break;
+            }
+            case ModDest::FilterFreq:
+            {
+                // Log-scale for musically even sweeps
+                float logLo = std::log (20.f), logHi = std::log (20000.f);
+                float target = std::exp (logLo + norm * (logHi - logLo));
+                gran.filterFreqHz = cl (base.filterFreqHz + (target - base.filterFreqHz) * depth,
+                                        20.f, 20000.f);
+                break;
+            }
+            case ModDest::FilterQ:
+            {
+                float target = 0.5f + norm * 9.5f;
+                gran.filterRes = cl (base.filterRes + (target - base.filterRes) * depth,
+                                     0.5f, 10.f);
+                break;
+            }
+            case ModDest::Drive:
+            {
+                gran.distDrive = cl (base.distDrive + (norm - base.distDrive) * depth, 0.f, 1.f);
+                break;
+            }
+            case ModDest::ReverbMix:
+            {
+                gran.reverbMix = cl (base.reverbMix + (norm - base.reverbMix) * depth, 0.f, 1.f);
+                break;
+            }
+            case ModDest::ReverbSize:
+            {
+                gran.reverbSize = cl (base.reverbSize + (norm - base.reverbSize) * depth, 0.f, 1.f);
+                break;
+            }
+            case ModDest::LoopSizeMs:
+            {
+                float target = 5.f + norm * 4995.f;
+                gran.loopSizeMs = cl (base.loopSizeMs + (target - base.loopSizeMs) * depth,
+                                      5.f, 5000.f);
+                break;
+            }
+            default: break;
+        }
+    }
+
     SampleLibrary      library_;
     GranularVoice      voice_;
     EuclideanSequencer sequencer_;
+    FuncGen            funcGens_[Params::kNumFuncGens];
 
     double   sampleRate_           = 44100.0;
     double   lastInputPhase_       = 0.0;   // for computing master phase delta
     double   voicePhaseAccum_      = 0.0;   // accumulated voice phase (rate × delta)
     double   lastTransformedPhase_ = 0.0;
+    double   fgPhaseAccum_[Params::kNumFuncGens] = {}; // FuncGen phase accumulators
     int      lastSeqSteps_         = -1;
     int      lastSeqHits_          = -1;
     int      lastSeqRotation_      = -1;

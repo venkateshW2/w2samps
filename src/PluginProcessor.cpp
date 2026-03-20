@@ -63,6 +63,17 @@ void W2SamplerProcessor::registerVoiceParams (int v, const juce::String& px)
     addParameter (p.loopSizeMs   = new juce::AudioParameterFloat (px+"loopMs",   "Loop Ms",
                                        juce::NormalisableRange<float> (5.0f, 5000.0f, 0.0f, 0.3f), 100.0f));
     addParameter (p.loopSizeLock = new juce::AudioParameterBool  (px+"loopLock", "Loop Lock",  false));
+
+    // Function generators (2 per voice)
+    for (int fg = 0; fg < W2SamplerProcessor::VoiceParamPtrs::kNumFg; ++fg)
+    {
+        juce::String fpx = px + "fg" + juce::String (fg) + "_";
+        addParameter (p.fgRate[fg]  = new juce::AudioParameterInt   (fpx+"rate",  "FG Rate",  0, kNumFgRates - 1, 4));
+        addParameter (p.fgDest[fg]  = new juce::AudioParameterInt   (fpx+"dest",  "FG Dest",  0, kNumModDests - 1, 0));
+        addParameter (p.fgDepth[fg] = new juce::AudioParameterFloat (fpx+"depth", "FG Depth", {-1.0f, 1.0f}, 0.0f));
+        addParameter (p.fgMin[fg]   = new juce::AudioParameterFloat (fpx+"min",   "FG Min",   {0.0f, 1.0f}, 0.0f));
+        addParameter (p.fgMax[fg]   = new juce::AudioParameterFloat (fpx+"max",   "FG Max",   {0.0f, 1.0f}, 1.0f));
+    }
 }
 
 //==============================================================================
@@ -239,6 +250,17 @@ void W2SamplerProcessor::fillVoiceParams (int v, VoiceChannel::Params& out) cons
     g.loopEnd        = p.loopEnd->get();
     g.loopSizeMs     = p.loopSizeMs->get();
     g.loopSizeLock   = p.loopSizeLock->get();
+
+    // FuncGen mod routing
+    for (int fg = 0; fg < W2SamplerProcessor::VoiceParamPtrs::kNumFg; ++fg)
+    {
+        if (!p.fgRate[fg]) continue;
+        out.fgRate[fg]  = kFgRateMults[p.fgRate[fg]->get()];
+        out.fgDest[fg]  = p.fgDest[fg]->get();
+        out.fgDepth[fg] = p.fgDepth[fg]->get();
+        out.fgMin[fg]   = p.fgMin[fg]->get();
+        out.fgMax[fg]   = p.fgMax[fg]->get();
+    }
 }
 
 //==============================================================================
@@ -414,6 +436,16 @@ static void writeVoiceCore (juce::MemoryOutputStream& s, const W2SamplerProcesso
     // v5 additions
     s.writeFloat (p.preGain->get());
     s.writeFloat (p.limitThresh->get());
+    // v7 additions — FuncGen routing (10 values per voice: 2 FGs × 5 params)
+    for (int fg = 0; fg < W2SamplerProcessor::VoiceParamPtrs::kNumFg; ++fg)
+    {
+        if (!p.fgRate[fg]) { s.writeInt(4); s.writeInt(0); s.writeFloat(0); s.writeFloat(0); s.writeFloat(1); continue; }
+        s.writeInt   (p.fgRate[fg]->get());
+        s.writeInt   (p.fgDest[fg]->get());
+        s.writeFloat (p.fgDepth[fg]->get());
+        s.writeFloat (p.fgMin[fg]->get());
+        s.writeFloat (p.fgMax[fg]->get());
+    }
 }
 
 static bool readVoiceCore (juce::MemoryInputStream& s, W2SamplerProcessor::VoiceParamPtrs& p, int ver)
@@ -459,13 +491,30 @@ static bool readVoiceCore (juce::MemoryInputStream& s, W2SamplerProcessor::Voice
         *p.preGain     = 1.0f;
         *p.limitThresh = 0.0f;
     }
+    // v7: FuncGen routing
+    if (ver >= 7 && s.getNumBytesRemaining() >= (int)(W2SamplerProcessor::VoiceParamPtrs::kNumFg * 20))
+    {
+        for (int fg = 0; fg < W2SamplerProcessor::VoiceParamPtrs::kNumFg; ++fg)
+        {
+            int   rate  = s.readInt();
+            int   dest  = s.readInt();
+            float depth = s.readFloat();
+            float fmin  = s.readFloat();
+            float fmax  = s.readFloat();
+            if (p.fgRate[fg])  *p.fgRate[fg]  = rate;
+            if (p.fgDest[fg])  *p.fgDest[fg]  = dest;
+            if (p.fgDepth[fg]) *p.fgDepth[fg] = depth;
+            if (p.fgMin[fg])   *p.fgMin[fg]   = fmin;
+            if (p.fgMax[fg])   *p.fgMax[fg]   = fmax;
+        }
+    }
     return true;
 }
 
 void W2SamplerProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     juce::MemoryOutputStream s (destData, true);
-    s.writeByte (6);
+    s.writeByte (7);  // version 7: adds FuncGen routing + curve points
     s.writeFloat (bpm->get());
     s.writeInt   (clkDiv->get());
     s.writeFloat (masterGain->get());
@@ -495,6 +544,21 @@ void W2SamplerProcessor::getStateInformation (juce::MemoryBlock& destData)
                 s.writeFloat (pr.limitThresh);
             }
         }
+
+    // v7: FuncGen curve points (3 voices × 2 FGs × N points)
+    for (int v = 0; v < 3; ++v)
+        for (int fg = 0; fg < W2SamplerProcessor::VoiceParamPtrs::kNumFg; ++fg)
+        {
+            const auto& fgen = voices_[v].getFuncGen (fg);
+            int nPts = fgen.serialisedPointCount();
+            s.writeInt (nPts);
+            for (int i = 0; i < nPts; ++i)
+            {
+                auto pt = fgen.serialisedPoint (i);
+                s.writeFloat (pt.x);
+                s.writeFloat (pt.y);
+            }
+        }
 }
 
 void W2SamplerProcessor::setStateInformation (const void* data, int sizeInBytes)
@@ -502,7 +566,7 @@ void W2SamplerProcessor::setStateInformation (const void* data, int sizeInBytes)
     juce::MemoryInputStream s (data, (size_t) sizeInBytes, false);
     if (s.getNumBytesRemaining() < 1) return;
     int ver = (int) s.readByte();
-    if (ver < 4 || ver > 6) return;  // discard older/unknown formats
+    if (ver < 4 || ver > 7) return;  // discard older/unknown formats
     if (s.getNumBytesRemaining() < 4) return;
     *bpm    = s.readFloat();
     *clkDiv = s.readInt();
@@ -536,6 +600,28 @@ void W2SamplerProcessor::setStateInformation (const void* data, int sizeInBytes)
                     pr.gain       = s.readFloat();
                     pr.limitThresh = s.readFloat();
                 }
+            }
+    }
+
+    // v7: FuncGen curve points
+    if (ver >= 7)
+    {
+        for (int v = 0; v < 3; ++v)
+            for (int fg = 0; fg < W2SamplerProcessor::VoiceParamPtrs::kNumFg; ++fg)
+            {
+                if (s.getNumBytesRemaining() < 4) break;
+                int nPts = s.readInt();
+                std::vector<FuncGen::Point> pts;
+                pts.reserve ((size_t) nPts);
+                for (int i = 0; i < nPts; ++i)
+                {
+                    if (s.getNumBytesRemaining() < 8) break;
+                    FuncGen::Point p;
+                    p.x = s.readFloat();
+                    p.y = s.readFloat();
+                    pts.push_back (p);
+                }
+                voices_[v].getFuncGen (fg).setPoints (pts);
             }
     }
 }

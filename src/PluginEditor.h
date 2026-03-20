@@ -3,6 +3,131 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "PluginProcessor.h"
 #include "WaveformDisplay.h"
+#include "FuncGen.h"
+
+//==============================================================================
+// FuncGenCanvas — drawable Catmull-Rom curve editor for one FuncGen.
+//
+// Click anywhere on canvas   → add control point
+// Drag a control point       → move it (sort order maintained)
+// Double-click a point       → delete it
+//==============================================================================
+class FuncGenCanvas : public juce::Component
+{
+public:
+    std::function<void()> onChange;
+
+    void setFuncGen (FuncGen* fg) { funcGen_ = fg; repaint(); }
+    FuncGen* getFuncGen() const   { return funcGen_; }
+
+    void paint (juce::Graphics& g) override
+    {
+        auto b  = getLocalBounds();
+        int  bw = b.getWidth(), bh = b.getHeight();
+
+        // Dark background
+        g.setColour (juce::Colour (0xff1C1C1E));
+        g.fillRoundedRectangle (b.toFloat(), 3.0f);
+
+        // Subtle grid (4 columns, 2 rows)
+        g.setColour (juce::Colour (0xff3A3A3C));
+        for (int i = 1; i < 4; ++i)
+            g.drawVerticalLine   (b.getX() + bw * i / 4, (float) b.getY(), (float) b.getBottom());
+        g.drawHorizontalLine (b.getCentreY(), (float) b.getX(), (float) b.getRight());
+
+        if (funcGen_ == nullptr) { g.drawRect (b, 1); return; }
+
+        // Curve (sample LUT across full width)
+        juce::Path curve;
+        bool started = false;
+        for (int px = 0; px < bw; ++px)
+        {
+            float t   = (float) px / (float) std::max (1, bw - 1);
+            float val = funcGen_->evaluate (t);
+            float fy  = (float) b.getBottom() - val * (float) bh;
+            if (!started) { curve.startNewSubPath ((float)(b.getX() + px), fy); started = true; }
+            else          { curve.lineTo           ((float)(b.getX() + px), fy); }
+        }
+        g.setColour (juce::Colour (0xff30D158));  // kActive green
+        g.strokePath (curve, juce::PathStrokeType (1.5f));
+
+        // Control points
+        const auto& pts = funcGen_->getPoints();
+        for (int i = 0; i < (int) pts.size(); ++i)
+        {
+            float px = (float) b.getX() + pts[(size_t)i].x * (float) bw;
+            float py = (float) b.getBottom() - pts[(size_t)i].y * (float) bh;
+            bool sel = (i == selectedPt_);
+            g.setColour (sel ? juce::Colours::white : juce::Colour (0xff30D158));
+            g.fillEllipse (px - 5.f, py - 5.f, 10.f, 10.f);
+            g.setColour (juce::Colour (0xff1C1C1E));
+            g.drawEllipse (px - 5.f, py - 5.f, 10.f, 10.f, 1.0f);
+        }
+
+        g.setColour (juce::Colour (0xff636366));
+        g.drawRoundedRectangle (b.toFloat().reduced (0.5f), 3.0f, 1.0f);
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        if (funcGen_ == nullptr) return;
+        selectedPt_ = findNearest (e.x, e.y);
+        if (selectedPt_ == -1)
+        {
+            float nx = (float) e.x / (float) std::max (1, getWidth());
+            float ny = 1.0f - (float) e.y / (float) std::max (1, getHeight());
+            funcGen_->addPoint (nx, ny);
+            selectedPt_ = findNearest (e.x, e.y);
+            if (onChange) onChange();
+        }
+        repaint();
+    }
+
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        if (funcGen_ == nullptr || selectedPt_ == -1) return;
+        float nx = (float) e.x / (float) std::max (1, getWidth());
+        float ny = 1.0f - (float) e.y / (float) std::max (1, getHeight());
+        funcGen_->movePoint (selectedPt_, nx, ny);
+        selectedPt_ = findNearest (e.x, e.y);
+        if (onChange) onChange();
+        repaint();
+    }
+
+    void mouseUp (const juce::MouseEvent&) override { selectedPt_ = -1; repaint(); }
+
+    void mouseDoubleClick (const juce::MouseEvent& e) override
+    {
+        if (funcGen_ == nullptr) return;
+        int idx = findNearest (e.x, e.y);
+        if (idx != -1)
+        {
+            funcGen_->removePoint (idx);
+            selectedPt_ = -1;
+            if (onChange) onChange();
+            repaint();
+        }
+    }
+
+private:
+    int findNearest (int mx, int my) const
+    {
+        if (funcGen_ == nullptr) return -1;
+        constexpr int kR = 12;
+        const auto& pts = funcGen_->getPoints();
+        for (int i = 0; i < (int) pts.size(); ++i)
+        {
+            int px = (int) (pts[(size_t)i].x * getWidth());
+            int py = getHeight() - (int) (pts[(size_t)i].y * getHeight());
+            int dx = mx - px, dy = my - py;
+            if (dx*dx + dy*dy < kR*kR) return i;
+        }
+        return -1;
+    }
+
+    FuncGen* funcGen_   = nullptr;
+    int      selectedPt_ = -1;
+};
 
 //==============================================================================
 // W2LookAndFeel — dark theme
@@ -230,9 +355,10 @@ private:
     // Per-voice UI (all three built; only selectedVoice shown in left panel)
     struct VoiceUI
     {
-        // ── Section accordion (4 sections in left panel: SAMPLE/SEQ/PHASE/SOUND) ──
-        juce::TextButton sectionBtn[5];   // 0-3 used in left panel, 4 unused
-        bool sectionOpen[5] = { true, true, false, false, false };
+        // ── Section accordion (left panel: SAMPLE/SEQ/PHASE/SOUND/MOD; FX/PRESETS bottom) ──
+        // 0=SAMPLE 1=SEQUENCE 2=PHASE 3=SOUND 4=FX/PRESETS(bottom) 5=MODULATION
+        juce::TextButton sectionBtn[6];
+        bool sectionOpen[6] = { true, true, false, false, false, false };
 
         // Nav row
         juce::TextButton loadBtn  { "Load" };
@@ -288,6 +414,18 @@ private:
         juce::Label      gainLabel     { "", "Level" };
         juce::Label      preGainLabel  { "", "Pre Gain" };
         juce::Label      limitLabel    { "", "Limit dB" };
+
+        // ── Modulation section (section 5, left panel) ───────────────────────
+        static constexpr int kNumFg = 2;
+        FuncGenCanvas    fgCanvas[kNumFg];
+        juce::TextButton fgRateBtn[kNumFg];
+        juce::TextButton fgDestBtn[kNumFg];
+        juce::Slider     fgDepthSlider[kNumFg];
+        juce::Slider     fgMinSlider[kNumFg];
+        juce::Slider     fgMaxSlider[kNumFg];
+        juce::Label      fgDepthLabel[kNumFg];
+        juce::Label      fgMinLabel[kNumFg];
+        juce::Label      fgMaxLabel[kNumFg];
 
         // FX/Presets (shown in bottom bar)
         bool             rndLocked[10] = {};
