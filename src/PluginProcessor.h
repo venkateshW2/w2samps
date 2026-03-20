@@ -3,6 +3,7 @@
 #include <juce_audio_formats/juce_audio_formats.h>
 #include "MasterClock.h"
 #include "VoiceChannel.h"
+#include "TimelineEnv.h"
 
 /**
  * W2SamplerProcessor — Phase 1 (phasor-based, 3 voices).
@@ -180,6 +181,13 @@ public:
     /** Access a voice's FuncGen from the message thread (editor draws + edits). */
     FuncGen& getVoiceFuncGen (int v, int fg) { return voices_[v].getFuncGen (fg); }
 
+    //==========================================================================
+    // Timeline envelopes (up to 8 macro-scale multi-dest envelopes)
+    static constexpr int kMaxTimelines = 8;
+
+    TimelineEnv& getTimeline (int i)       { return timelines_[i]; }
+    const TimelineEnv& getTimeline (int i) const { return timelines_[i]; }
+
 private:
     void fillVoiceParams  (int v, VoiceChannel::Params& out) const;
     double selectInputPhase (int v, double masterPhase) const;
@@ -187,6 +195,7 @@ private:
 
     MasterClock  clock_;
     VoiceChannel voices_[3];
+    TimelineEnv  timelines_[kMaxTimelines];
     juce::AudioFormatManager formatManager_;
     double sampleRate_ = 44100.0;
     std::atomic<bool>  isPlaying_    { false };

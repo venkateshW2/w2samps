@@ -78,6 +78,12 @@ public:
         // ── GranularVoice DSP chain ───────────────────────────────────────────
         GranularVoice::Params granular;
 
+        // ── External mods (Timeline envelopes, applied alongside FuncGen mods) ─
+        // Processor fills these before calling processBlock. Each slot: dest≥0 active.
+        static constexpr int kMaxExtMods = 8;
+        struct ExtMod { int dest = -1; float norm = 0.f; float depth = 0.f; };
+        ExtMod extMods[kMaxExtMods];
+
         // ── Function generator modulation ────────────────────────────────────
         // 4 FuncGens per voice.
         // fgSync: true = rate is a multiplier vs master phasor delta
@@ -184,8 +190,8 @@ public:
         // ── Build mutable granular params (loop anchor may be overridden) ────────
         GranularVoice::Params gran = params.granular;
 
-        // ── Apply FuncGen modulation to gran params ───────────────────────────
-        // Clear mod output per dest first (last FG wins if multiple target same dest)
+        // ── Apply FuncGen + Timeline modulation to gran params ────────────────
+        // Clear mod output per dest first (last write wins if multiple target same dest)
         for (int d = 0; d < (int) ModDest::kCount; ++d)
             destModNorm_[d].store (-1.f, std::memory_order_relaxed);  // -1 = inactive
 
@@ -199,6 +205,16 @@ public:
             float depth = params.fgDepth[i];
             applyModDest (gran, params.granular, dest, norm, depth);
             destModNorm_[(int) dest].store (norm, std::memory_order_relaxed);
+        }
+
+        // External mods (Timeline envelopes — added by processor before this call)
+        for (int i = 0; i < Params::kMaxExtMods; ++i)
+        {
+            const auto& em = params.extMods[i];
+            if (em.dest < 1 || em.dest >= (int) ModDest::kCount) continue;
+            auto dest = (ModDest) em.dest;
+            applyModDest (gran, params.granular, dest, em.norm, em.depth);
+            destModNorm_[em.dest].store (em.norm, std::memory_order_relaxed);
         }
 
         // ── Find step crossings in [lastPhase, newPhase) ──────────────────────
@@ -390,6 +406,15 @@ public:
     // FuncGen access (editor draws + edits curves on message thread)
     FuncGen&       getFuncGen (int i)       { return funcGens_[(size_t) i]; }
     const FuncGen& getFuncGen (int i) const { return funcGens_[(size_t) i]; }
+
+    /** Expose applyModDest publicly so the processor can apply Timeline mods
+     *  to a GranularVoice::Params before rendering. */
+    static void applyMod (GranularVoice::Params& gran,
+                          const GranularVoice::Params& base,
+                          ModDest dest, float norm, float depth) noexcept
+    {
+        applyModDest (gran, base, dest, norm, depth);
+    }
 
     /** Current FuncGen phase [0,1] — written by audio thread, safe to read from timer. */
     float getFgPhase (int i) const

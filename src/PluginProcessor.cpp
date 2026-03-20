@@ -146,6 +146,24 @@ void W2SamplerProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     int  solo     = soloVoice_.load();
     bool anySolo  = (solo >= 0 && solo < 3);
 
+    // Tick all active timeline envelopes and collect their outputs
+    struct TlOut { int voice; int dest; float norm; float depth; };
+    std::array<TlOut, kMaxTimelines * TimelineEnv::kMaxDests> tlOuts;
+    int tlOutCount = 0;
+    for (int t = 0; t < kMaxTimelines; ++t)
+    {
+        auto& tl = timelines_[t];
+        if (!tl.isActive()) continue;
+        tl.tick (isPlaying_.load(), numSamples, sampleRate_);
+        float raw = tl.evaluate();
+        for (const auto& d : tl.getActiveDests())
+        {
+            float norm = d.min + raw * (d.max - d.min);
+            if (tlOutCount < (int) tlOuts.size())
+                tlOuts[(size_t) tlOutCount++] = { d.voice, d.dest, norm, d.depth };
+        }
+    }
+
     VoiceChannel::Params vcp;
     for (int v = 0; v < 3; ++v)
     {
@@ -153,6 +171,19 @@ void W2SamplerProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         voices_[v].setMuted (muted);
 
         fillVoiceParams (v, vcp);
+
+        // Populate external mods from timeline outputs targeting this voice
+        int emIdx = 0;
+        for (int t = 0; t < tlOutCount && emIdx < VoiceChannel::Params::kMaxExtMods; ++t)
+        {
+            const auto& tlo = tlOuts[(size_t) t];
+            if (tlo.voice != v) continue;
+            vcp.extMods[emIdx++] = { tlo.dest, tlo.norm, tlo.depth };
+        }
+        // Clear remaining ext mod slots
+        for (int i = emIdx; i < VoiceChannel::Params::kMaxExtMods; ++i)
+            vcp.extMods[i] = {};
+
         double inputPhase = selectInputPhase (v, masterPhase);
         voices_[v].processBlock (inputPhase, vcp, buffer, 0, numSamples);
     }
