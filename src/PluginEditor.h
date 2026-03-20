@@ -440,8 +440,10 @@ private:
         // ── Modulation section (section 5, left panel) ───────────────────────
         static constexpr int kNumFg = 4;
         FuncGenCanvas    fgCanvas[kNumFg];
-        juce::TextButton fgRateBtn[kNumFg];
-        juce::TextButton fgDestBtn[kNumFg];
+        juce::TextButton fgSyncBtn[kNumFg];   // SYNC / FREE toggle
+        juce::Slider     fgRateSlider[kNumFg]; // continuous rate (mult or Hz)
+        juce::Label      fgRateLabel[kNumFg];
+        juce::ComboBox   fgDestBox[kNumFg];    // dropdown for mod destination
         juce::Slider     fgDepthSlider[kNumFg];
         juce::Slider     fgMinSlider[kNumFg];
         juce::Slider     fgMaxSlider[kNumFg];

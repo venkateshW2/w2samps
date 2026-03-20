@@ -135,10 +135,9 @@ void W2SamplerEditor::buildTransportBar()
     }
 
     // Mute/Solo buttons — built here, positioned in master column
-    const char* vn[] = { "V1", "V2", "V3" };
     for (int v = 0; v < 3; ++v)
     {
-        muteBtn[v].setButtonText (juce::String (vn[v]) + " M");
+        muteBtn[v].setButtonText ("M");
         styleButton (muteBtn[v]);
         muteBtn[v].onClick = [this, v] {
             bool m = !proc.getVoiceMuted (v);
@@ -148,7 +147,7 @@ void W2SamplerEditor::buildTransportBar()
         };
         addAndMakeVisible (muteBtn[v]);
 
-        soloBtn[v].setButtonText (juce::String (vn[v]) + " S");
+        soloBtn[v].setButtonText ("S");
         styleButton (soloBtn[v]);
         soloBtn[v].onClick = [this, v] {
             proc.setVoiceSolo (v);
@@ -485,28 +484,57 @@ void W2SamplerEditor::buildVoiceUI (int v)
         ui.fgCanvas[fg].onChange = [this] { repaint(); };
         leftContent_.addAndMakeVisible (ui.fgCanvas[fg]);
 
-        // Rate cycling button
-        ui.fgRateBtn[fg].setButtonText (kFgRateNames[proc.vp[v].fgRate[fg] ? proc.vp[v].fgRate[fg]->get() : 4]);
-        styleButton (ui.fgRateBtn[fg]);
-        ui.fgRateBtn[fg].onClick = [this, v, fg] {
-            if (!proc.vp[v].fgRate[fg]) return;
-            int next = (proc.vp[v].fgRate[fg]->get() + 1) % kNumFgRates;
-            *proc.vp[v].fgRate[fg] = next;
-            voiceUI[v].fgRateBtn[fg].setButtonText (kFgRateNames[next]);
+        // Sync/Free toggle
+        bool isSynced = proc.vp[v].fgSync[fg] ? proc.vp[v].fgSync[fg]->get() : true;
+        ui.fgSyncBtn[fg].setButtonText (isSynced ? "SYNC" : "FREE");
+        styleButton (ui.fgSyncBtn[fg]);
+        ui.fgSyncBtn[fg].setColour (juce::TextButton::buttonColourId,
+            juce::Colour (isSynced ? kActive : kElevated));
+        ui.fgSyncBtn[fg].onClick = [this, v, fg] {
+            if (!proc.vp[v].fgSync[fg]) return;
+            bool next = !proc.vp[v].fgSync[fg]->get();
+            *proc.vp[v].fgSync[fg] = next;
+            voiceUI[v].fgSyncBtn[fg].setButtonText (next ? "SYNC" : "FREE");
+            voiceUI[v].fgSyncBtn[fg].setColour (juce::TextButton::buttonColourId,
+                juce::Colour (next ? kActive : kElevated));
         };
-        leftContent_.addAndMakeVisible (ui.fgRateBtn[fg]);
+        leftContent_.addAndMakeVisible (ui.fgSyncBtn[fg]);
 
-        // Destination cycling button
-        int curDest = proc.vp[v].fgDest[fg] ? proc.vp[v].fgDest[fg]->get() : 0;
-        ui.fgDestBtn[fg].setButtonText (kModDestNames[curDest]);
-        styleButton (ui.fgDestBtn[fg]);
-        ui.fgDestBtn[fg].onClick = [this, v, fg] {
-            if (!proc.vp[v].fgDest[fg]) return;
-            int next = (proc.vp[v].fgDest[fg]->get() + 1) % kNumModDests;
-            *proc.vp[v].fgDest[fg] = next;
-            voiceUI[v].fgDestBtn[fg].setButtonText (kModDestNames[next]);
+        // Rate slider — continuous (mult when sync, Hz when free). Log range 0.001–32.
+        float initRate = proc.vp[v].fgRateVal[fg] ? proc.vp[v].fgRateVal[fg]->get() : 1.0f;
+        ui.fgRateSlider[fg].setSliderStyle (juce::Slider::LinearHorizontal);
+        ui.fgRateSlider[fg].setTextBoxStyle (juce::Slider::TextBoxRight, false, 44, 18);
+        ui.fgRateSlider[fg].setNormalisableRange (
+            juce::NormalisableRange<double> (0.001, 32.0, 0.0, 0.3));
+        ui.fgRateSlider[fg].setValue (initRate, juce::dontSendNotification);
+        ui.fgRateSlider[fg].setDoubleClickReturnValue (true, 1.0);
+        ui.fgRateSlider[fg].setColour (juce::Slider::textBoxTextColourId, juce::Colour (kTextDim));
+        ui.fgRateSlider[fg].setColour (juce::Slider::textBoxBackgroundColourId, juce::Colour (kPanel));
+        ui.fgRateSlider[fg].setColour (juce::Slider::textBoxOutlineColourId, juce::Colour (0));
+        ui.fgRateSlider[fg].onValueChange = [this, v, fg] {
+            if (proc.vp[v].fgRateVal[fg])
+                *proc.vp[v].fgRateVal[fg] = (float) voiceUI[v].fgRateSlider[fg].getValue();
         };
-        leftContent_.addAndMakeVisible (ui.fgDestBtn[fg]);
+        ui.fgRateLabel[fg].setText ("Rate", juce::dontSendNotification);
+        styleLabel (ui.fgRateLabel[fg]);
+        leftContent_.addAndMakeVisible (ui.fgRateSlider[fg]);
+        leftContent_.addAndMakeVisible (ui.fgRateLabel[fg]);
+
+        // Destination — ComboBox (dark-styled, inherits editor LookAndFeel)
+        ui.fgDestBox[fg].setColour (juce::ComboBox::backgroundColourId,  juce::Colour (kPanel));
+        ui.fgDestBox[fg].setColour (juce::ComboBox::textColourId,        juce::Colour (kText));
+        ui.fgDestBox[fg].setColour (juce::ComboBox::outlineColourId,     juce::Colour (kAccent));
+        ui.fgDestBox[fg].setColour (juce::ComboBox::arrowColourId,       juce::Colour (kTextDim));
+        for (int d = 0; d < kNumModDests; ++d)
+            ui.fgDestBox[fg].addItem (kModDestNames[d], d + 1);  // IDs are 1-based
+        ui.fgDestBox[fg].setSelectedItemIndex (
+            proc.vp[v].fgDest[fg] ? proc.vp[v].fgDest[fg]->get() : 0,
+            juce::dontSendNotification);
+        ui.fgDestBox[fg].onChange = [this, v, fg] {
+            if (proc.vp[v].fgDest[fg])
+                *proc.vp[v].fgDest[fg] = voiceUI[v].fgDestBox[fg].getSelectedItemIndex();
+        };
+        leftContent_.addAndMakeVisible (ui.fgDestBox[fg]);
 
         // Depth slider
         styleSlider (ui.fgDepthSlider[fg], -1.0f, 1.0f,
@@ -651,21 +679,25 @@ void W2SamplerEditor::layoutMasterColumn()
     int rightX = W - kRightW;
     masterColumnRect_ = { rightX, 0, kRightW, H };
 
-    // Mute/Solo — one row per voice: [M] [S] side by side
-    const int msRowH    = 20;
-    const int msStartY  = kTransportH + 16;
-    const int halfW     = kRightW / 2 - 3;
+    // Mute/Solo — compact rows with voice color strip
+    // Layout per row: [3px color strip] [gap 3] [M 26px] [3px gap] [S 26px] = 61px
+    const int msRowH   = 22;
+    const int msStartY = kTransportH + 4;
+    const int btnW     = 26;
+    const juce::Colour vcols[] = { juce::Colour (kV0), juce::Colour (kV1), juce::Colour (kV2) };
+    (void)vcols;  // used in paint()
     for (int v = 0; v < 3; ++v)
     {
-        int rowY = msStartY + v * (msRowH + 2);
-        muteBtn[v].setBounds (rightX + 2,            rowY, halfW, msRowH - 2);
+        int rowY = msStartY + v * (msRowH + 3);
+        // [color strip 4px] [M 28px] [gap 2] [S 28px] — left-aligned within right column
+        muteBtn[v].setBounds (rightX + 8,          rowY, btnW, msRowH - 2);
         muteBtn[v].setVisible (true);
-        soloBtn[v].setBounds (rightX + halfW + 5,    rowY, kRightW - halfW - 7, msRowH - 2);
+        soloBtn[v].setBounds (rightX + 8 + btnW + 3, rowY, btnW, msRowH - 2);
         soloBtn[v].setVisible (true);
     }
 
     // Meter bars start below mute/solo section
-    const int barTopY = msStartY + 3 * (msRowH + 2) + 8;
+    const int barTopY = msStartY + 3 * (msRowH + 3) + 8;
     const int barH    = H - barTopY - 36;
 
     // Vertical fader
@@ -727,7 +759,8 @@ void W2SamplerEditor::hideVoiceAll()
         for (int fg = 0; fg < VoiceUI::kNumFg; ++fg)
         {
             hide (ui.fgCanvas[fg]);
-            hide (ui.fgRateBtn[fg]);   hide (ui.fgDestBtn[fg]);
+            hide (ui.fgSyncBtn[fg]);     hide (ui.fgRateSlider[fg]); hide (ui.fgRateLabel[fg]);
+            hide (ui.fgDestBox[fg]);
             hide (ui.fgDepthSlider[fg]); hide (ui.fgDepthLabel[fg]);
             hide (ui.fgMinSlider[fg]);   hide (ui.fgMinLabel[fg]);
             hide (ui.fgMaxSlider[fg]);   hide (ui.fgMaxLabel[fg]);
@@ -931,36 +964,50 @@ void W2SamplerEditor::layoutVoicePanel (int v)
 
         for (int fg = 0; fg < VoiceUI::kNumFg; ++fg)
         {
-            // Canvas (full width)
+            // Canvas (full width, taller for curve drawing)
             ui.fgCanvas[fg].setBounds (x0, y, cw, cvH);
             ui.fgCanvas[fg].setVisible (true);
             y += cvH + 2;
 
-            // Row: [Rate 56px] [Dest 106px] [Depth label 38px] [Depth slider fill]
-            const int ratW = 56, desW = 106, dlbW = 38;
-            ui.fgRateBtn[fg].setBounds   (x0,                     y, ratW,         rh - 2);
-            ui.fgDestBtn[fg].setBounds   (x0 + ratW + 2,          y, desW,         rh - 2);
-            ui.fgDepthLabel[fg].setBounds(x0 + ratW + desW + 4,   y, dlbW,         rh - 2);
-            ui.fgDepthSlider[fg].setBounds(x0 + ratW + desW + dlbW + 4, y,
-                                           cw - ratW - desW - dlbW - 6, rh - 2);
-            ui.fgRateBtn[fg].setVisible  (true);
-            ui.fgDestBtn[fg].setVisible  (true);
-            ui.fgDepthLabel[fg].setVisible(true);
-            ui.fgDepthSlider[fg].setVisible(true);
+            // Row 1: [SYNC/FREE 48px] [Rate label 30px] [Rate slider fill]
+            const int synW = 48, rlbW = 30;
+            ui.fgSyncBtn[fg].setBounds   (x0,                y, synW,          rh - 2);
+            ui.fgRateLabel[fg].setBounds (x0 + synW + 2,     y, rlbW,          rh - 2);
+            ui.fgRateSlider[fg].setBounds(x0 + synW + rlbW + 2, y, cw - synW - rlbW - 4, rh - 2);
+            ui.fgSyncBtn[fg].setVisible  (true);
+            ui.fgRateLabel[fg].setVisible(true);
+            ui.fgRateSlider[fg].setVisible(true);
             y += rh + 2;
 
-            // Row: [Min label 32px] [Min slider fill/2] [Max label 32px] [Max slider fill/2]
-            const int mnlW = 32;
-            int halfW = (cw - mnlW * 2) / 2;
-            ui.fgMinLabel[fg].setBounds  (x0,                    y, mnlW,  rh - 2);
-            ui.fgMinSlider[fg].setBounds (x0 + mnlW,             y, halfW, rh - 2);
-            ui.fgMaxLabel[fg].setBounds  (x0 + mnlW + halfW + 2, y, mnlW,  rh - 2);
-            ui.fgMaxSlider[fg].setBounds (x0 + mnlW*2 + halfW + 2, y, halfW, rh - 2);
-            ui.fgMinLabel[fg].setVisible (true);
-            ui.fgMinSlider[fg].setVisible(true);
-            ui.fgMaxLabel[fg].setVisible (true);
-            ui.fgMaxSlider[fg].setVisible(true);
-            y += rh + 4;
+            // Row 2: [Dest dropdown full width]
+            ui.fgDestBox[fg].setBounds (x0, y, cw, rh - 2);
+            ui.fgDestBox[fg].setVisible (true);
+            y += rh + 2;
+
+            // Row 3: [Depth label 38px] [Depth slider fill] [Min label 30px] [Min sl half] [Max label 30px] [Max sl fill]
+            const int dlbW = 36, mnlW = 30;
+            int remainW = cw - dlbW;
+            int halfSl = (remainW - mnlW * 2) / 2;
+            ui.fgDepthLabel[fg].setBounds (x0,                    y, dlbW,   rh - 2);
+            ui.fgDepthSlider[fg].setBounds(x0 + dlbW,             y, cw - dlbW - mnlW*2 - halfSl*2, rh - 2);
+            ui.fgMinLabel[fg].setBounds   (x0 + dlbW + (cw - dlbW - mnlW*2 - halfSl*2), y, mnlW, rh - 2);
+            ui.fgMinSlider[fg].setBounds  (x0 + dlbW + (cw - dlbW - mnlW*2 - halfSl*2) + mnlW, y, halfSl, rh - 2);
+            ui.fgMaxLabel[fg].setBounds   (x0 + dlbW + (cw - dlbW - mnlW*2 - halfSl*2) + mnlW + halfSl, y, mnlW, rh - 2);
+            ui.fgMaxSlider[fg].setBounds  (x0 + dlbW + (cw - dlbW - mnlW*2 - halfSl*2) + mnlW*2 + halfSl, y, halfSl, rh - 2);
+
+            // Simpler 3-row layout: Depth | Min | Max split evenly
+            const int thirdW = (cw - dlbW) / 3;
+            ui.fgDepthLabel[fg].setBounds (x0,              y, dlbW,   rh - 2);
+            ui.fgDepthSlider[fg].setBounds(x0 + dlbW,       y, thirdW, rh - 2);
+            ui.fgMinLabel[fg].setBounds   (x0 + dlbW + thirdW,         y, mnlW,   rh - 2);
+            ui.fgMinSlider[fg].setBounds  (x0 + dlbW + thirdW + mnlW,  y, thirdW - mnlW, rh - 2);
+            ui.fgMaxLabel[fg].setBounds   (x0 + dlbW + thirdW*2,       y, mnlW,   rh - 2);
+            ui.fgMaxSlider[fg].setBounds  (x0 + dlbW + thirdW*2 + mnlW, y, cw - dlbW - thirdW*2 - mnlW, rh - 2);
+
+            ui.fgDepthLabel[fg].setVisible(true); ui.fgDepthSlider[fg].setVisible(true);
+            ui.fgMinLabel[fg].setVisible  (true); ui.fgMinSlider[fg].setVisible  (true);
+            ui.fgMaxLabel[fg].setVisible  (true); ui.fgMaxSlider[fg].setVisible  (true);
+            y += rh + 6;  // extra gap between FGs
         }
         y += sectionGap;
     }
@@ -1266,15 +1313,27 @@ void W2SamplerEditor::drawMasterColumn (juce::Graphics& g)
     g.drawText ("OUTPUT", mr.getX(), mr.getY() + 6, mr.getWidth(), 12,
                 juce::Justification::centred);
 
-    // Mute/Solo section header
-    g.setColour (juce::Colour (kTextDim));
-    g.setFont (juce::Font (juce::FontOptions{}.withName ("Menlo").withHeight (9.0f)));
-    g.drawText ("M/S", mr.getX(), mr.getY() + kTransportH + 4, mr.getWidth(), 12,
-                juce::Justification::centred);
+    // Voice color strips alongside M/S buttons (drawn in paint so no Component needed)
+    {
+        const int msRowH_   = 22;
+        const int msStartY_ = kTransportH + 4;
+        const juce::Colour vc[] = { juce::Colour(kV0), juce::Colour(kV1), juce::Colour(kV2) };
+        const char* vn[] = { "1", "2", "3" };
+        for (int v = 0; v < 3; ++v)
+        {
+            int rowY = mr.getY() + msStartY_ + v * (msRowH_ + 3);
+            // Color strip — 4px wide on the left of each row
+            g.setColour (vc[v]);
+            g.fillRect (mr.getX() + 2, rowY, 4, msRowH_ - 2);
+            // Small voice number
+            g.setFont (juce::Font (juce::FontOptions{}.withHeight (8.0f)));
+            g.setColour (juce::Colours::black.withAlpha (0.7f));
+            g.drawText (vn[v], mr.getX() + 2, rowY, 4, msRowH_ - 2, juce::Justification::centred);
+        }
+    }
 
-    // "ST LUFS" label + value — below mute/solo rows
-    // msStartY = kTransportH+16, 3 rows of 22px = 66, gap 8 → barTopY = kTransportH+90
-    const int barTopYDraw = kTransportH + 90;
+    // LUFS — below mute/solo rows: msStartY(4) + 3*(22+3) + 8 = kTransportH+87
+    const int barTopYDraw = kTransportH + 87;
     float lufs = proc.getShortTermLufs();
     g.setColour (juce::Colour (kTextDim));
     g.setFont (juce::Font (juce::FontOptions{}.withName ("Menlo").withHeight (9.0f)));

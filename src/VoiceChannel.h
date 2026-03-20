@@ -79,13 +79,15 @@ public:
         GranularVoice::Params granular;
 
         // ── Function generator modulation ────────────────────────────────────
-        // 4 FuncGens per voice. Rate index:
-        //   0-6  = sync (kFgRateMults[idx] × master phasor delta)
-        //   7-13 = free Hz (kFgFreeRateHz[idx-7], independent of BPM)
+        // 4 FuncGens per voice.
+        // fgSync: true = rate is a multiplier vs master phasor delta
+        //         false = rate is Hz (free-running, BPM-independent)
+        // fgRateVal: 0.001–32.0 (multiplier when sync, Hz when free)
         static constexpr int kNumFuncGens = 4;
-        int   fgRateIdx[kNumFuncGens] = { 4, 4, 4, 4 };  // index into kFgRateNames (default=1 bar sync)
-        int   fgDest[kNumFuncGens]    = { 0, 0, 0, 0 };   // ModDest index
-        float fgDepth[kNumFuncGens]   = { 0.f, 0.f, 0.f, 0.f };  // -1 → +1
+        float fgRateVal[kNumFuncGens] = { 1.f, 1.f, 1.f, 1.f };   // sync mult or free Hz
+        bool  fgSync[kNumFuncGens]    = { true, true, true, true }; // sync to phasor or free Hz
+        int   fgDest[kNumFuncGens]    = { 0, 0, 0, 0 };            // ModDest index
+        float fgDepth[kNumFuncGens]   = { 0.f, 0.f, 0.f, 0.f };   // -1 → +1
         float fgMin[kNumFuncGens]     = { 0.f, 0.f, 0.f, 0.f };   // normalised range lo
         float fgMax[kNumFuncGens]     = { 1.f, 1.f, 1.f, 1.f };   // normalised range hi
     };
@@ -170,12 +172,11 @@ public:
         // ── Accumulate FuncGen phases (independent of voice rate) ────────────
         for (int i = 0; i < Params::kNumFuncGens; ++i)
         {
-            int rateIdx = params.fgRateIdx[i];
-            if (rateIdx < kNumFgSyncRates)
-                fgPhaseAccum_[i] += inputDelta * (double) kFgRateMults[rateIdx];
+            double rate = (double) params.fgRateVal[i];
+            if (params.fgSync[i])
+                fgPhaseAccum_[i] += inputDelta * rate;          // sync: × master delta
             else
-                fgPhaseAccum_[i] += (double) kFgFreeRateHz[rateIdx - kNumFgSyncRates]
-                                    * (double) numSamples / sampleRate_;
+                fgPhaseAccum_[i] += rate * (double) numSamples / sampleRate_;  // free Hz
             while (fgPhaseAccum_[i] >= 1.0) fgPhaseAccum_[i] -= 1.0;
             fgPhaseOut_[i].store ((float) fgPhaseAccum_[i], std::memory_order_relaxed);
         }

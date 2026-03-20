@@ -72,11 +72,12 @@ public:
 
         // Function generator modulation (4 per voice)
         static constexpr int kNumFg = 4;
-        juce::AudioParameterInt*   fgRate[kNumFg]  = {};  // 0–13: 0-6 sync, 7-13 free Hz
-        juce::AudioParameterInt*   fgDest[kNumFg]  = {};  // ModDest 0–11
-        juce::AudioParameterFloat* fgDepth[kNumFg] = {};  // -1 → +1
-        juce::AudioParameterFloat* fgMin[kNumFg]   = {};  // 0 → 1 (normalised range lo)
-        juce::AudioParameterFloat* fgMax[kNumFg]   = {};  // 0 → 1 (normalised range hi)
+        juce::AudioParameterFloat* fgRateVal[kNumFg] = {};  // 0.001–32.0 (mult when sync, Hz when free)
+        juce::AudioParameterBool*  fgSync[kNumFg]    = {};  // true=sync to phasor, false=free Hz
+        juce::AudioParameterInt*   fgDest[kNumFg]    = {};  // ModDest index
+        juce::AudioParameterFloat* fgDepth[kNumFg]   = {};  // -1 → +1
+        juce::AudioParameterFloat* fgMin[kNumFg]     = {};  // 0 → 1 (normalised range lo)
+        juce::AudioParameterFloat* fgMax[kNumFg]     = {};  // 0 → 1 (normalised range hi)
     };
 
     //==========================================================================

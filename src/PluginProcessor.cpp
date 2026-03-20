@@ -64,15 +64,19 @@ void W2SamplerProcessor::registerVoiceParams (int v, const juce::String& px)
                                        juce::NormalisableRange<float> (5.0f, 5000.0f, 0.0f, 0.3f), 100.0f));
     addParameter (p.loopSizeLock = new juce::AudioParameterBool  (px+"loopLock", "Loop Lock",  false));
 
-    // Function generators (2 per voice)
+    // Function generators (4 per voice)
     for (int fg = 0; fg < W2SamplerProcessor::VoiceParamPtrs::kNumFg; ++fg)
     {
         juce::String fpx = px + "fg" + juce::String (fg) + "_";
-        addParameter (p.fgRate[fg]  = new juce::AudioParameterInt   (fpx+"rate",  "FG Rate",  0, kNumFgRates - 1, 4));
-        addParameter (p.fgDest[fg]  = new juce::AudioParameterInt   (fpx+"dest",  "FG Dest",  0, kNumModDests - 1, 0));
-        addParameter (p.fgDepth[fg] = new juce::AudioParameterFloat (fpx+"depth", "FG Depth", {-1.0f, 1.0f}, 0.0f));
-        addParameter (p.fgMin[fg]   = new juce::AudioParameterFloat (fpx+"min",   "FG Min",   {0.0f, 1.0f}, 0.0f));
-        addParameter (p.fgMax[fg]   = new juce::AudioParameterFloat (fpx+"max",   "FG Max",   {0.0f, 1.0f}, 1.0f));
+        // Rate: 0.001–32.0 (multiplier when sync, Hz when free). Log skew for usable range.
+        addParameter (p.fgRateVal[fg] = new juce::AudioParameterFloat (
+            fpx+"rateV", "FG Rate",
+            juce::NormalisableRange<float> (0.001f, 32.0f, 0.0f, 0.3f), 1.0f));
+        addParameter (p.fgSync[fg]    = new juce::AudioParameterBool  (fpx+"sync",  "FG Sync",  true));
+        addParameter (p.fgDest[fg]    = new juce::AudioParameterInt   (fpx+"dest",  "FG Dest",  0, kNumModDests - 1, 0));
+        addParameter (p.fgDepth[fg]   = new juce::AudioParameterFloat (fpx+"depth", "FG Depth", {-1.0f, 1.0f}, 0.0f));
+        addParameter (p.fgMin[fg]     = new juce::AudioParameterFloat (fpx+"min",   "FG Min",   {0.0f, 1.0f}, 0.0f));
+        addParameter (p.fgMax[fg]     = new juce::AudioParameterFloat (fpx+"max",   "FG Max",   {0.0f, 1.0f}, 1.0f));
     }
 }
 
@@ -251,11 +255,12 @@ void W2SamplerProcessor::fillVoiceParams (int v, VoiceChannel::Params& out) cons
     g.loopSizeMs     = p.loopSizeMs->get();
     g.loopSizeLock   = p.loopSizeLock->get();
 
-    // FuncGen mod routing (pass raw rate index — VoiceChannel decides sync vs free)
+    // FuncGen mod routing
     for (int fg = 0; fg < W2SamplerProcessor::VoiceParamPtrs::kNumFg; ++fg)
     {
-        if (!p.fgRate[fg]) continue;
-        out.fgRateIdx[fg] = p.fgRate[fg]->get();
+        if (!p.fgRateVal[fg]) continue;
+        out.fgRateVal[fg] = p.fgRateVal[fg]->get();
+        out.fgSync[fg]    = p.fgSync[fg]->get();
         out.fgDest[fg]    = p.fgDest[fg]->get();
         out.fgDepth[fg]   = p.fgDepth[fg]->get();
         out.fgMin[fg]     = p.fgMin[fg]->get();
@@ -436,11 +441,12 @@ static void writeVoiceCore (juce::MemoryOutputStream& s, const W2SamplerProcesso
     // v5 additions
     s.writeFloat (p.preGain->get());
     s.writeFloat (p.limitThresh->get());
-    // v8 additions — FuncGen routing (20 values per voice: 4 FGs × 5 params)
+    // v9 additions — FuncGen routing (4 FGs × 6 params: rateVal float + sync bool + dest + depth + min + max)
     for (int fg = 0; fg < W2SamplerProcessor::VoiceParamPtrs::kNumFg; ++fg)
     {
-        if (!p.fgRate[fg]) { s.writeInt(4); s.writeInt(0); s.writeFloat(0); s.writeFloat(0); s.writeFloat(1); continue; }
-        s.writeInt   (p.fgRate[fg]->get());
+        if (!p.fgRateVal[fg]) { s.writeFloat(1.0f); s.writeBool(true); s.writeInt(0); s.writeFloat(0); s.writeFloat(0); s.writeFloat(1); continue; }
+        s.writeFloat (p.fgRateVal[fg]->get());
+        s.writeBool  (p.fgSync[fg]->get());
         s.writeInt   (p.fgDest[fg]->get());
         s.writeFloat (p.fgDepth[fg]->get());
         s.writeFloat (p.fgMin[fg]->get());
@@ -491,23 +497,50 @@ static bool readVoiceCore (juce::MemoryInputStream& s, W2SamplerProcessor::Voice
         *p.preGain     = 1.0f;
         *p.limitThresh = 0.0f;
     }
-    // v7: 2 FuncGens per voice routing; v8: 4 FuncGens per voice
+    // v7/v8: old int-index rate format; v9: float rateVal + bool sync
     {
-        int fgToRead = 0;
-        if (ver == 7 && s.getNumBytesRemaining() >= 40) fgToRead = 2;   // old: 2 FGs × 20 bytes
-        if (ver >= 8 && s.getNumBytesRemaining() >= 80) fgToRead = W2SamplerProcessor::VoiceParamPtrs::kNumFg;
-        for (int fg = 0; fg < fgToRead; ++fg)
+        const int kNFg = W2SamplerProcessor::VoiceParamPtrs::kNumFg;
+        auto applyFg = [&] (int fg, float rateV, bool sync, int dest, float depth, float fmin, float fmax)
         {
-            int   rate  = s.readInt();
-            int   dest  = s.readInt();
-            float depth = s.readFloat();
-            float fmin  = s.readFloat();
-            float fmax  = s.readFloat();
-            if (p.fgRate[fg])  *p.fgRate[fg]  = rate;
-            if (p.fgDest[fg])  *p.fgDest[fg]  = dest;
-            if (p.fgDepth[fg]) *p.fgDepth[fg] = depth;
-            if (p.fgMin[fg])   *p.fgMin[fg]   = fmin;
-            if (p.fgMax[fg])   *p.fgMax[fg]   = fmax;
+            if (p.fgRateVal[fg]) *p.fgRateVal[fg] = rateV;
+            if (p.fgSync[fg])    *p.fgSync[fg]    = sync;
+            if (p.fgDest[fg])    *p.fgDest[fg]    = dest;
+            if (p.fgDepth[fg])   *p.fgDepth[fg]   = depth;
+            if (p.fgMin[fg])     *p.fgMin[fg]     = fmin;
+            if (p.fgMax[fg])     *p.fgMax[fg]     = fmax;
+        };
+        auto idxToRateV = [&] (int idx, bool& outSync) -> float {
+            outSync = (idx < 7);
+            return outSync ? kFgRateMults[juce::jlimit(0,6,idx)]
+                           : kFgFreeRateHz[juce::jlimit(0,6,idx-7)];
+        };
+
+        if (ver == 7 && s.getNumBytesRemaining() >= 40)
+        {
+            for (int fg = 0; fg < 2; ++fg) {
+                int ri = s.readInt(); int dest = s.readInt();
+                float depth = s.readFloat(), fmin = s.readFloat(), fmax = s.readFloat();
+                bool sync; float rv = idxToRateV(ri, sync);
+                applyFg(fg, rv, sync, dest, depth, fmin, fmax);
+            }
+        }
+        else if (ver == 8 && s.getNumBytesRemaining() >= kNFg * 20)
+        {
+            for (int fg = 0; fg < kNFg; ++fg) {
+                int ri = s.readInt(); int dest = s.readInt();
+                float depth = s.readFloat(), fmin = s.readFloat(), fmax = s.readFloat();
+                bool sync; float rv = idxToRateV(ri, sync);
+                applyFg(fg, rv, sync, dest, depth, fmin, fmax);
+            }
+        }
+        else if (ver >= 9 && s.getNumBytesRemaining() >= kNFg * 21)
+        {
+            for (int fg = 0; fg < kNFg; ++fg) {
+                float rv = s.readFloat(); bool sync = s.readBool();
+                int dest = s.readInt();
+                float depth = s.readFloat(), fmin = s.readFloat(), fmax = s.readFloat();
+                applyFg(fg, rv, sync, dest, depth, fmin, fmax);
+            }
         }
     }
     return true;
@@ -516,7 +549,7 @@ static bool readVoiceCore (juce::MemoryInputStream& s, W2SamplerProcessor::Voice
 void W2SamplerProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     juce::MemoryOutputStream s (destData, true);
-    s.writeByte (8);  // version 8: 4 FuncGens per voice (was 2), free-running rates
+    s.writeByte (9);  // version 9: FG rate = continuous float + sync bool (was int index)
     s.writeFloat (bpm->get());
     s.writeInt   (clkDiv->get());
     s.writeFloat (masterGain->get());
@@ -568,7 +601,7 @@ void W2SamplerProcessor::setStateInformation (const void* data, int sizeInBytes)
     juce::MemoryInputStream s (data, (size_t) sizeInBytes, false);
     if (s.getNumBytesRemaining() < 1) return;
     int ver = (int) s.readByte();
-    if (ver < 4 || ver > 8) return;  // discard older/unknown formats
+    if (ver < 4 || ver > 9) return;  // discard older/unknown formats
     if (s.getNumBytesRemaining() < 4) return;
     *bpm    = s.readFloat();
     *clkDiv = s.readInt();
@@ -605,7 +638,7 @@ void W2SamplerProcessor::setStateInformation (const void* data, int sizeInBytes)
             }
     }
 
-    // v7/v8: FuncGen curve points (v7=2 FGs, v8=4 FGs)
+    // v7+: FuncGen curve points (v7=2 FGs, v8/v9=4 FGs)
     if (ver >= 7)
     {
         int fgCurveCount = (ver >= 8) ? W2SamplerProcessor::VoiceParamPtrs::kNumFg : 2;
