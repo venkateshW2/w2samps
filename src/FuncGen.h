@@ -23,10 +23,18 @@
 enum class ModDest : int
 {
     None = 0,
+    // ── GranularVoice params (applied inside GranularVoice::renderBlock) ──
     Pitch, Attack, Decay, Sustain, Release,
     FilterFreq, FilterQ,
     Drive, ReverbMix, ReverbSize,
     LoopSizeMs,
+    // ── VoiceChannel params (applied before phase transform + sequencer) ──
+    Rate,           // voice rate multiplier [0.125–8.0]
+    PhaseOffset,    // phase time-shift [0–1]
+    Warp,           // phasor curve [-1–+1]
+    SeqSteps,       // euclidean step count [1–32]
+    SeqHits,        // euclidean active hits [0–steps]
+    SeqRotation,    // euclidean rotation [0–steps-1]
     kCount
 };
 
@@ -37,7 +45,9 @@ static const char* kModDestNames[(int) ModDest::kCount] = {
     "Pitch", "Attack", "Decay", "Sustain", "Release",
     "Flt Hz", "Flt Q",
     "Drive", "Rvb Mix", "Rvb Sz",
-    "Loop ms"
+    "Loop ms",
+    "Rate", "Ph Offset", "Warp",
+    "Seq Steps", "Seq Hits", "Seq Rot"
 };
 
 // FuncGen rate presets.
@@ -60,7 +70,7 @@ class FuncGen
 {
 public:
     static constexpr int kLutSize   = 512;
-    static constexpr int kMaxPoints = 8;
+    static constexpr int kMaxPoints = 32;
 
     struct Point { float x = 0.0f; float y = 0.5f; };
 

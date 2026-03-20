@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmake --version)",
+      "Bash(xcode-select -p)",
+      "Bash(clang --version)",
+      "Bash(brew --version)",
+      "Bash(brew install:*)",
+      "Bash(chmod +x /Users/justmac/w2app/w2-audio-plugs/build.sh)",
+      "Bash(cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON)",
+      "Bash(cmake --build build --parallel)",
+      "Bash(find build/W2Sampler_artefacts/Debug -maxdepth 3 \\\\\\(-name *.app -o -name *.vst3 -o -name *.clap -o -name *.component \\\\\\))",
+      "Bash(open \"build/W2Sampler_artefacts/Debug/Standalone/W2 Sampler.app\")",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"Initial commit: W2 Sampler v0.2:*)",
+      "Bash(git commit:*)",
+      "Bash(bash build.sh Debug)",
+      "Bash(cmake --build build --config Debug)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(./build.sh)",
+      "Bash(git push:*)",
+      "Bash(git remote:*)",
+      "Bash(cmake --build /Users/justmac/w2app/w2-audio-plugs/build --parallel)"
+    ],
+    "additionalDirectories": [
+      "/Users/justmac/w2app/w2-audio-plugs",
+      "/Users/justmac/.claude/projects/-Users-justmac-w2app-w2-audio-plugs"
+    ]
+  }
+}

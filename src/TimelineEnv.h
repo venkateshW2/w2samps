@@ -38,7 +38,8 @@ public:
 
     // Message-thread editable properties
     std::atomic<float> durationSec { 60.0f };  // total cycle length
-    std::atomic<bool>  looping     { false };  // loop at end or hold
+    std::atomic<bool>  looping     { false };
+    std::atomic<float> rateMultiplier { 1.0f };  // playback speed (0.1–10×)  // loop at end or hold
 
     FuncGen curve;   // the curve shape (message thread edits, audio thread reads LUT)
 
@@ -106,7 +107,9 @@ public:
         {
             float dur = durationSec.load (std::memory_order_relaxed);
             if (dur < 0.001f) dur = 0.001f;
-            timeSec_ += (double) numSamples / sampleRate;
+            float rate = rateMultiplier.load (std::memory_order_relaxed);
+            if (rate < 0.01f) rate = 0.01f;
+            timeSec_ += (double) numSamples / sampleRate * (double) rate;
             if (timeSec_ >= (double) dur)
             {
                 if (looping.load (std::memory_order_relaxed))

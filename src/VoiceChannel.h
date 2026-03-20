@@ -149,79 +149,124 @@ public:
         if (inputDelta < 0.0) inputDelta += 1.0;   // handle master clock wrap
         lastInputPhase_ = inputPhase;
 
-        voicePhaseAccum_ += inputDelta * (double) params.rate;
-        while (voicePhaseAccum_ >= 1.0) voicePhaseAccum_ -= 1.0;
-
-        // ── Apply remaining phase transforms (offset / warp / reverse / quant)
-        // Rate is already baked in above — pass rateMultiplier = 1.
-        PhaseTransform pt;
-        pt.rateMultiplier = 1.0f;
-        pt.phaseOffset    = params.phaseOffset;
-        pt.warp           = params.warp;
-        pt.reverse        = params.reverse;
-        pt.quantiseAmount = params.quantiseAmount;
-        pt.stepsForQuant  = params.seqSteps;
-
-        double newPhase = pt.apply (voicePhaseAccum_);
-
-        // ── Rebuild euclidean pattern only when changed ───────────────────────
-        if (params.seqSteps    != lastSeqSteps_    ||
-            params.seqHits     != lastSeqHits_     ||
-            params.seqRotation != lastSeqRotation_)
-        {
-            sequencer_.set (params.seqSteps, params.seqHits, params.seqRotation);
-            lastSeqSteps_    = params.seqSteps;
-            lastSeqHits_     = params.seqHits;
-            lastSeqRotation_ = params.seqRotation;
-        }
-
-        // ── Accumulate FuncGen phases (independent of voice rate) ────────────
+        // ── Accumulate FuncGen phases (before mod application so FG can target voice params) ─
         for (int i = 0; i < Params::kNumFuncGens; ++i)
         {
             double rate = (double) params.fgRateVal[i];
             if (params.fgSync[i])
-                fgPhaseAccum_[i] += inputDelta * rate;          // sync: × master delta
+                fgPhaseAccum_[i] += inputDelta * rate;
             else
-                fgPhaseAccum_[i] += rate * (double) numSamples / sampleRate_;  // free Hz
+                fgPhaseAccum_[i] += rate * (double) numSamples / sampleRate_;
             while (fgPhaseAccum_[i] >= 1.0) fgPhaseAccum_[i] -= 1.0;
             fgPhaseOut_[i].store ((float) fgPhaseAccum_[i], std::memory_order_relaxed);
         }
 
-        // ── Build mutable granular params (loop anchor may be overridden) ────────
+        // ── Build mutable gran + voice-level mod targets ──────────────────────
         GranularVoice::Params gran = params.granular;
 
-        // ── Apply FuncGen + Timeline modulation to gran params ────────────────
-        // Clear mod output per dest first (last write wins if multiple target same dest)
-        for (int d = 0; d < (int) ModDest::kCount; ++d)
-            destModNorm_[d].store (-1.f, std::memory_order_relaxed);  // -1 = inactive
+        // Mutable voice-level params (modulation targets)
+        float modRate        = params.rate;
+        float modPhaseOffset = params.phaseOffset;
+        float modWarp        = params.warp;
+        int   modSeqSteps    = params.seqSteps;
+        int   modSeqHits     = params.seqHits;
+        int   modSeqRot      = params.seqRotation;
 
+        // ── Clear mod output per dest ─────────────────────────────────────────
+        for (int d = 0; d < (int) ModDest::kCount; ++d)
+            destModNorm_[d].store (-1.f, std::memory_order_relaxed);
+
+        // Lambda: apply voice-level mod dest (those not handled by applyModDest)
+        auto applyVoiceMod = [&] (ModDest dest, float norm, float depth)
+        {
+            auto cl = [] (float v, float lo, float hi) { return v<lo?lo:(v>hi?hi:v); };
+            switch (dest)
+            {
+                case ModDest::Rate:
+                    modRate = cl (modRate + (0.125f + norm * 7.875f - modRate) * depth, 0.125f, 8.0f);
+                    break;
+                case ModDest::PhaseOffset:
+                    modPhaseOffset = cl (modPhaseOffset + (norm - modPhaseOffset) * depth, 0.f, 1.f);
+                    break;
+                case ModDest::Warp:
+                    modWarp = cl (modWarp + ((norm * 2.f - 1.f) - modWarp) * depth, -1.f, 1.f);
+                    break;
+                case ModDest::SeqSteps:
+                    modSeqSteps = juce::jlimit (1, 32, (int) (1 + norm * 31.f));
+                    break;
+                case ModDest::SeqHits:
+                    modSeqHits  = juce::jlimit (0, modSeqSteps, (int) (norm * (float) modSeqSteps));
+                    break;
+                case ModDest::SeqRotation:
+                    modSeqRot   = juce::jlimit (0, std::max (0, modSeqSteps - 1),
+                                                (int) (norm * (float) std::max (1, modSeqSteps - 1)));
+                    break;
+                default: break;
+            }
+        };
+
+        // ── Apply FuncGen mods (gran + voice-level) ───────────────────────────
         for (int i = 0; i < Params::kNumFuncGens; ++i)
         {
             auto dest = (ModDest) params.fgDest[i];
             if (dest == ModDest::None || params.fgDepth[i] == 0.0f) continue;
 
-            float raw   = funcGens_[i].evaluate ((float) fgPhaseAccum_[i]);
-            float norm  = params.fgMin[i] + raw * (params.fgMax[i] - params.fgMin[i]);
+            float raw  = funcGens_[i].evaluate ((float) fgPhaseAccum_[i]);
+            float norm = params.fgMin[i] + raw * (params.fgMax[i] - params.fgMin[i]);
             float depth = params.fgDepth[i];
-            applyModDest (gran, params.granular, dest, norm, depth);
+
+            if ((int) dest < (int) ModDest::Rate)
+                applyModDest (gran, params.granular, dest, norm, depth);
+            else
+                applyVoiceMod (dest, norm, depth);
+
             destModNorm_[(int) dest].store (norm, std::memory_order_relaxed);
         }
 
-        // External mods (Timeline envelopes — added by processor before this call)
+        // ── Apply ext mods (Timeline envelopes) ──────────────────────────────
         for (int i = 0; i < Params::kMaxExtMods; ++i)
         {
             const auto& em = params.extMods[i];
             if (em.dest < 1 || em.dest >= (int) ModDest::kCount) continue;
             auto dest = (ModDest) em.dest;
-            applyModDest (gran, params.granular, dest, em.norm, em.depth);
+            if ((int) dest < (int) ModDest::Rate)
+                applyModDest (gran, params.granular, dest, em.norm, em.depth);
+            else
+                applyVoiceMod (dest, em.norm, em.depth);
             destModNorm_[em.dest].store (em.norm, std::memory_order_relaxed);
+        }
+
+        // ── Use modulated rate to advance voice phasor ────────────────────────
+        voicePhaseAccum_ += inputDelta * (double) modRate;
+        while (voicePhaseAccum_ >= 1.0) voicePhaseAccum_ -= 1.0;
+
+        // ── Apply remaining phase transforms using modulated params ───────────
+        PhaseTransform pt;
+        pt.rateMultiplier = 1.0f;
+        pt.phaseOffset    = modPhaseOffset;
+        pt.warp           = modWarp;
+        pt.reverse        = params.reverse;
+        pt.quantiseAmount = params.quantiseAmount;
+        pt.stepsForQuant  = modSeqSteps;
+
+        double newPhase = pt.apply (voicePhaseAccum_);
+
+        // ── Rebuild euclidean pattern (using modulated steps/hits/rot) ────────
+        if (modSeqSteps != lastSeqSteps_    ||
+            modSeqHits  != lastSeqHits_     ||
+            modSeqRot   != lastSeqRotation_)
+        {
+            sequencer_.set (modSeqSteps, modSeqHits, modSeqRot);
+            lastSeqSteps_    = modSeqSteps;
+            lastSeqHits_     = modSeqHits;
+            lastSeqRotation_ = modSeqRot;
         }
 
         // ── Find step crossings in [lastPhase, newPhase) ──────────────────────
         int firedSteps[32];
         int numFired = PhaseTransform::findStepCrossings (
             lastTransformedPhase_, newPhase,
-            params.seqSteps, 1.0,
+            modSeqSteps, 1.0,
             firedSteps, 32);
 
         // ── Trigger on euclidean hits ─────────────────────────────────────────
@@ -367,8 +412,8 @@ public:
 
         // ── Update UI-readable state ──────────────────────────────────────────
         transformedPhase_.store (newPhase);
-        if (params.seqSteps > 0)
-            currentStep_.store ((int)(newPhase * params.seqSteps) % params.seqSteps);
+        if (modSeqSteps > 0)
+            currentStep_.store ((int)(newPhase * modSeqSteps) % modSeqSteps);
         lastTransformedPhase_ = newPhase;
 
         // ── Keep gran.loopStart/End in sync for rendering ────────────────────────
