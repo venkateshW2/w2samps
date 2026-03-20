@@ -70,9 +70,9 @@ public:
         juce::AudioParameterFloat* loopSizeMs   = nullptr; // 5–5000 ms
         juce::AudioParameterBool*  loopSizeLock = nullptr;
 
-        // Function generator modulation (2 per voice)
-        static constexpr int kNumFg = 2;
-        juce::AudioParameterInt*   fgRate[kNumFg]  = {};  // 0–6 index into kFgRateMults
+        // Function generator modulation (4 per voice)
+        static constexpr int kNumFg = 4;
+        juce::AudioParameterInt*   fgRate[kNumFg]  = {};  // 0–13: 0-6 sync, 7-13 free Hz
         juce::AudioParameterInt*   fgDest[kNumFg]  = {};  // ModDest 0–11
         juce::AudioParameterFloat* fgDepth[kNumFg] = {};  // -1 → +1
         juce::AudioParameterFloat* fgMin[kNumFg]   = {};  // 0 → 1 (normalised range lo)

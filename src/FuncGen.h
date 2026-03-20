@@ -40,11 +40,20 @@ static const char* kModDestNames[(int) ModDest::kCount] = {
     "Loop ms"
 };
 
-// FuncGen rate presets: multiplier vs master phasor
-// (master phasor = 0→1 per clkDiv beats, default 1 bar)
-static constexpr float kFgRateMults[] = { 16.f, 8.f, 4.f, 2.f, 1.f, 0.5f, 0.25f };
-static const char*     kFgRateNames[] = { "1/16", "1/8", "1/4", "1/2", "1 bar", "2 bar", "4 bar" };
-static constexpr int   kNumFgRates    = 7;
+// FuncGen rate presets.
+// Index 0-6:  sync rates (multiplier vs master phasor delta per sample)
+// Index 7-13: free-running rates in Hz (independent of BPM/clock)
+static constexpr float kFgRateMults[]    = { 16.f, 8.f, 4.f, 2.f, 1.f, 0.5f, 0.25f };
+static constexpr float kFgFreeRateHz[]   = { 0.1f, 0.25f, 0.5f, 1.f, 2.f, 4.f, 8.f };
+static const char*     kFgRateNames[]    = {
+    // sync (indices 0-6)
+    "1/16", "1/8", "1/4", "1/2", "1 bar", "2 bar", "4 bar",
+    // free Hz (indices 7-13)
+    "0.1Hz", "0.25Hz", "0.5Hz", "1Hz", "2Hz", "4Hz", "8Hz"
+};
+static constexpr int   kNumFgRates       = 14;  // total presets
+static constexpr int   kNumFgSyncRates   = 7;   // first 7 = sync
+static constexpr int   kNumFgFreeRates   = 7;   // last  7 = free Hz
 
 //==============================================================================
 class FuncGen

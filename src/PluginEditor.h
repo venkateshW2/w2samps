@@ -20,6 +20,13 @@ public:
     void setFuncGen (FuncGen* fg) { funcGen_ = fg; repaint(); }
     FuncGen* getFuncGen() const   { return funcGen_; }
 
+    /** Call from timer with current FG phase [0,1] — draws a vertical playhead. */
+    void setPlayhead (float phase)
+    {
+        playheadPhase_ = phase;
+        repaint();
+    }
+
     void paint (juce::Graphics& g) override
     {
         auto b  = getLocalBounds();
@@ -62,6 +69,20 @@ public:
             g.fillEllipse (px - 5.f, py - 5.f, 10.f, 10.f);
             g.setColour (juce::Colour (0xff1C1C1E));
             g.drawEllipse (px - 5.f, py - 5.f, 10.f, 10.f, 1.0f);
+        }
+
+        // Playhead — vertical line at current phase position
+        if (playheadPhase_ >= 0.f)
+        {
+            int phX = b.getX() + (int) (playheadPhase_ * (float) bw);
+            g.setColour (juce::Colour (0xffFFD60A).withAlpha (0.75f));  // gold
+            g.drawVerticalLine (phX, (float) b.getY(), (float) b.getBottom());
+            // Small triangle indicator at top
+            juce::Path tri;
+            tri.addTriangle ((float) phX, (float) b.getY(),
+                             (float) phX - 4.f, (float) b.getY() - 6.f,
+                             (float) phX + 4.f, (float) b.getY() - 6.f);
+            g.fillPath (tri);
         }
 
         g.setColour (juce::Colour (0xff636366));
@@ -125,8 +146,9 @@ private:
         return -1;
     }
 
-    FuncGen* funcGen_   = nullptr;
-    int      selectedPt_ = -1;
+    FuncGen* funcGen_      = nullptr;
+    int      selectedPt_   = -1;
+    float    playheadPhase_ = -1.f;  // -1 = hidden
 };
 
 //==============================================================================
@@ -416,7 +438,7 @@ private:
         juce::Label      limitLabel    { "", "Limit dB" };
 
         // ── Modulation section (section 5, left panel) ───────────────────────
-        static constexpr int kNumFg = 2;
+        static constexpr int kNumFg = 4;
         FuncGenCanvas    fgCanvas[kNumFg];
         juce::TextButton fgRateBtn[kNumFg];
         juce::TextButton fgDestBtn[kNumFg];
@@ -426,6 +448,26 @@ private:
         juce::Label      fgDepthLabel[kNumFg];
         juce::Label      fgMinLabel[kNumFg];
         juce::Label      fgMaxLabel[kNumFg];
+
+        // ── Mod indicator bars (one per ModDest, shown below SOUND sliders) ──
+        // A thin accent-coloured strip below each modulated slider.
+        // Width = destModNorm × slider width. Hidden when no FG targets that dest.
+        struct ModBar : juce::Component
+        {
+            float normValue = 0.f;
+            juce::Colour barColour;
+            void paint (juce::Graphics& g) override
+            {
+                if (normValue < 0.001f) return;
+                g.setColour (barColour.withAlpha (0.85f));
+                g.fillRect (0, 0, (int)(normValue * (float)getWidth()), getHeight());
+                // Dim fill for remaining range
+                g.setColour (barColour.withAlpha (0.15f));
+                g.fillRect ((int)(normValue * (float)getWidth()), 0,
+                            getWidth() - (int)(normValue * (float)getWidth()), getHeight());
+            }
+        };
+        ModBar destModBars[kNumModDests];
 
         // FX/Presets (shown in bottom bar)
         bool             rndLocked[10] = {};

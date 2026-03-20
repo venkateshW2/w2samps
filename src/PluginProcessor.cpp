@@ -251,15 +251,15 @@ void W2SamplerProcessor::fillVoiceParams (int v, VoiceChannel::Params& out) cons
     g.loopSizeMs     = p.loopSizeMs->get();
     g.loopSizeLock   = p.loopSizeLock->get();
 
-    // FuncGen mod routing
+    // FuncGen mod routing (pass raw rate index — VoiceChannel decides sync vs free)
     for (int fg = 0; fg < W2SamplerProcessor::VoiceParamPtrs::kNumFg; ++fg)
     {
         if (!p.fgRate[fg]) continue;
-        out.fgRate[fg]  = kFgRateMults[p.fgRate[fg]->get()];
-        out.fgDest[fg]  = p.fgDest[fg]->get();
-        out.fgDepth[fg] = p.fgDepth[fg]->get();
-        out.fgMin[fg]   = p.fgMin[fg]->get();
-        out.fgMax[fg]   = p.fgMax[fg]->get();
+        out.fgRateIdx[fg] = p.fgRate[fg]->get();
+        out.fgDest[fg]    = p.fgDest[fg]->get();
+        out.fgDepth[fg]   = p.fgDepth[fg]->get();
+        out.fgMin[fg]     = p.fgMin[fg]->get();
+        out.fgMax[fg]     = p.fgMax[fg]->get();
     }
 }
 
@@ -436,7 +436,7 @@ static void writeVoiceCore (juce::MemoryOutputStream& s, const W2SamplerProcesso
     // v5 additions
     s.writeFloat (p.preGain->get());
     s.writeFloat (p.limitThresh->get());
-    // v7 additions — FuncGen routing (10 values per voice: 2 FGs × 5 params)
+    // v8 additions — FuncGen routing (20 values per voice: 4 FGs × 5 params)
     for (int fg = 0; fg < W2SamplerProcessor::VoiceParamPtrs::kNumFg; ++fg)
     {
         if (!p.fgRate[fg]) { s.writeInt(4); s.writeInt(0); s.writeFloat(0); s.writeFloat(0); s.writeFloat(1); continue; }
@@ -491,10 +491,12 @@ static bool readVoiceCore (juce::MemoryInputStream& s, W2SamplerProcessor::Voice
         *p.preGain     = 1.0f;
         *p.limitThresh = 0.0f;
     }
-    // v7: FuncGen routing
-    if (ver >= 7 && s.getNumBytesRemaining() >= (int)(W2SamplerProcessor::VoiceParamPtrs::kNumFg * 20))
+    // v7: 2 FuncGens per voice routing; v8: 4 FuncGens per voice
     {
-        for (int fg = 0; fg < W2SamplerProcessor::VoiceParamPtrs::kNumFg; ++fg)
+        int fgToRead = 0;
+        if (ver == 7 && s.getNumBytesRemaining() >= 40) fgToRead = 2;   // old: 2 FGs × 20 bytes
+        if (ver >= 8 && s.getNumBytesRemaining() >= 80) fgToRead = W2SamplerProcessor::VoiceParamPtrs::kNumFg;
+        for (int fg = 0; fg < fgToRead; ++fg)
         {
             int   rate  = s.readInt();
             int   dest  = s.readInt();
@@ -514,7 +516,7 @@ static bool readVoiceCore (juce::MemoryInputStream& s, W2SamplerProcessor::Voice
 void W2SamplerProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     juce::MemoryOutputStream s (destData, true);
-    s.writeByte (7);  // version 7: adds FuncGen routing + curve points
+    s.writeByte (8);  // version 8: 4 FuncGens per voice (was 2), free-running rates
     s.writeFloat (bpm->get());
     s.writeInt   (clkDiv->get());
     s.writeFloat (masterGain->get());
@@ -545,7 +547,7 @@ void W2SamplerProcessor::getStateInformation (juce::MemoryBlock& destData)
             }
         }
 
-    // v7: FuncGen curve points (3 voices × 2 FGs × N points)
+    // v8: FuncGen curve points (3 voices × 4 FGs × N points)
     for (int v = 0; v < 3; ++v)
         for (int fg = 0; fg < W2SamplerProcessor::VoiceParamPtrs::kNumFg; ++fg)
         {
@@ -566,7 +568,7 @@ void W2SamplerProcessor::setStateInformation (const void* data, int sizeInBytes)
     juce::MemoryInputStream s (data, (size_t) sizeInBytes, false);
     if (s.getNumBytesRemaining() < 1) return;
     int ver = (int) s.readByte();
-    if (ver < 4 || ver > 7) return;  // discard older/unknown formats
+    if (ver < 4 || ver > 8) return;  // discard older/unknown formats
     if (s.getNumBytesRemaining() < 4) return;
     *bpm    = s.readFloat();
     *clkDiv = s.readInt();
@@ -603,11 +605,12 @@ void W2SamplerProcessor::setStateInformation (const void* data, int sizeInBytes)
             }
     }
 
-    // v7: FuncGen curve points
+    // v7/v8: FuncGen curve points (v7=2 FGs, v8=4 FGs)
     if (ver >= 7)
     {
+        int fgCurveCount = (ver >= 8) ? W2SamplerProcessor::VoiceParamPtrs::kNumFg : 2;
         for (int v = 0; v < 3; ++v)
-            for (int fg = 0; fg < W2SamplerProcessor::VoiceParamPtrs::kNumFg; ++fg)
+            for (int fg = 0; fg < fgCurveCount; ++fg)
             {
                 if (s.getNumBytesRemaining() < 4) break;
                 int nPts = s.readInt();

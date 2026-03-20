@@ -401,6 +401,22 @@ void W2SamplerEditor::buildVoiceUI (int v)
     leftContent_.addAndMakeVisible (ui.gainSlider);    leftContent_.addAndMakeVisible (ui.gainLabel);
     leftContent_.addAndMakeVisible (ui.limitSlider);   leftContent_.addAndMakeVisible (ui.limitLabel);
 
+    // Mod indicator bars — one per ModDest, overlaid below SOUND sliders
+    {
+        static const juce::Colour voiceColours[] = {
+            juce::Colour (W2LookAndFeel::kV0),
+            juce::Colour (W2LookAndFeel::kV1),
+            juce::Colour (W2LookAndFeel::kV2)
+        };
+        for (int d = 0; d < kNumModDests; ++d)
+        {
+            ui.destModBars[d].barColour = voiceColours[v];
+            ui.destModBars[d].normValue = 0.f;
+            leftContent_.addAndMakeVisible (ui.destModBars[d]);
+            ui.destModBars[d].setVisible (false);
+        }
+    }
+
     // FX / Presets — lock buttons
     static const char* lockNames[] = { "Pch","Atk","Dec","Sus","Rel","Flt","Res","Drv","Rvb","Sz" };
     for (int i = 0; i < 10; ++i)
@@ -716,6 +732,10 @@ void W2SamplerEditor::hideVoiceAll()
             hide (ui.fgMinSlider[fg]);   hide (ui.fgMinLabel[fg]);
             hide (ui.fgMaxSlider[fg]);   hide (ui.fgMaxLabel[fg]);
         }
+
+        // Mod indicator bars
+        for (int d = 0; d < kNumModDests; ++d)
+            hide (ui.destModBars[d]);
     }
 }
 
@@ -867,19 +887,35 @@ void W2SamplerEditor::layoutVoicePanel (int v)
         const int rh = 28;     // row height
         const int lw = 88;     // label width
 
-        placeSliderCell (ui.pitchLabel,   ui.pitchSlider,   x0, y, cw, rh, lw); y += rh + 2;
-        placeSliderCell (ui.attLabel,     ui.attSlider,     x0, y, cw, rh, lw); y += rh + 2;
-        placeSliderCell (ui.decLabel,     ui.decSlider,     x0, y, cw, rh, lw); y += rh + 2;
-        placeSliderCell (ui.susLabel,     ui.susSlider,     x0, y, cw, rh, lw); y += rh + 2;
-        placeSliderCell (ui.relLabel,     ui.relSlider,     x0, y, cw, rh, lw); y += rh + 2;
-        placeSliderCell (ui.fFreqLabel,   ui.fFreqSlider,   x0, y, cw, rh, lw); y += rh + 2;
-        placeSliderCell (ui.fResLabel,    ui.fResSlider,    x0, y, cw, rh, lw); y += rh + 2;
-        placeSliderCell (ui.driveLabel,   ui.driveSlider,   x0, y, cw, rh, lw); y += rh + 2;
-        placeSliderCell (ui.rvbMixLabel,  ui.rvbMixSlider,  x0, y, cw, rh, lw); y += rh + 2;
-        placeSliderCell (ui.rvbSzLabel,   ui.rvbSzSlider,   x0, y, cw, rh, lw); y += rh + 2;
-        placeSliderCell (ui.preGainLabel, ui.preGainSlider, x0, y, cw, rh, lw); y += rh + 2;
-        placeSliderCell (ui.gainLabel,    ui.gainSlider,    x0, y, cw, rh, lw); y += rh + 2;
-        placeSliderCell (ui.limitLabel,   ui.limitSlider,   x0, y, cw, rh, lw); y += rh + 2;
+        // Helper: place slider row + optional mod bar beneath the slider part
+        // modDest == ModDest::None means no bar for that row
+        auto placeSound = [&] (juce::Label& lbl, juce::Slider& sld, ModDest dest)
+        {
+            placeSliderCell (lbl, sld, x0, y, cw, rh, lw);
+            int d = (int) dest;
+            if (dest != ModDest::None && d < kNumModDests)
+            {
+                // 3-px bar along bottom edge of the slider track area
+                ui.destModBars[d].setBounds (x0 + lw, y + rh - 3, cw - lw, 3);
+                ui.destModBars[d].setVisible (true);
+                ui.destModBars[d].toFront (false);
+            }
+            y += rh + 2;
+        };
+
+        placeSound (ui.pitchLabel,   ui.pitchSlider,   ModDest::Pitch);
+        placeSound (ui.attLabel,     ui.attSlider,     ModDest::Attack);
+        placeSound (ui.decLabel,     ui.decSlider,     ModDest::Decay);
+        placeSound (ui.susLabel,     ui.susSlider,     ModDest::Sustain);
+        placeSound (ui.relLabel,     ui.relSlider,     ModDest::Release);
+        placeSound (ui.fFreqLabel,   ui.fFreqSlider,   ModDest::FilterFreq);
+        placeSound (ui.fResLabel,    ui.fResSlider,    ModDest::FilterQ);
+        placeSound (ui.driveLabel,   ui.driveSlider,   ModDest::Drive);
+        placeSound (ui.rvbMixLabel,  ui.rvbMixSlider,  ModDest::ReverbMix);
+        placeSound (ui.rvbSzLabel,   ui.rvbSzSlider,   ModDest::ReverbSize);
+        placeSound (ui.preGainLabel, ui.preGainSlider, ModDest::None);
+        placeSound (ui.gainLabel,    ui.gainSlider,    ModDest::None);
+        placeSound (ui.limitLabel,   ui.limitSlider,   ModDest::None);
         y += sectionGap;
     }
 
@@ -1384,6 +1420,36 @@ void W2SamplerEditor::timerCallback()
 
     // Sync selected voice params
     syncVoiceFromParams (selectedVoice);
+
+    // ── FuncGen playheads + mod indicator bars ──────────────────────────────
+    // Update playhead position on every canvas for the selected voice.
+    // Update mod bars for all dests on the selected voice.
+    {
+        auto& ui = voiceUI[selectedVoice];
+        const auto& voice = proc.getVoice (selectedVoice);
+
+        // Playheads
+        for (int fg = 0; fg < VoiceUI::kNumFg; ++fg)
+            ui.fgCanvas[fg].setPlayhead (voice.getFgPhase (fg));
+
+        // Mod bars — show/update for each ModDest
+        for (int d = 1; d < kNumModDests; ++d)  // skip None (0)
+        {
+            float norm = voice.getDestModNorm ((ModDest) d);
+            if (norm >= 0.f)
+            {
+                ui.destModBars[d].normValue = norm;
+                if (ui.destModBars[d].isVisible())
+                    ui.destModBars[d].repaint();
+            }
+            else
+            {
+                ui.destModBars[d].normValue = 0.f;
+                if (ui.destModBars[d].isVisible())
+                    ui.destModBars[d].repaint();
+            }
+        }
+    }
 
     const int W = getWidth();
     const int H = getHeight();

@@ -79,14 +79,15 @@ public:
         GranularVoice::Params granular;
 
         // ── Function generator modulation ────────────────────────────────────
-        // 2 FuncGens per voice. Each has a rate (×master delta), destination,
-        // depth (-1→+1), and min/max range in normalised [0,1] param space.
-        static constexpr int kNumFuncGens = 2;
-        float fgRate[kNumFuncGens]  = { 1.0f, 1.0f };  // multiplier vs master delta
-        int   fgDest[kNumFuncGens]  = { 0, 0 };         // ModDest index
-        float fgDepth[kNumFuncGens] = { 0.0f, 0.0f };   // -1 → +1
-        float fgMin[kNumFuncGens]   = { 0.0f, 0.0f };   // normalised param range lo
-        float fgMax[kNumFuncGens]   = { 1.0f, 1.0f };   // normalised param range hi
+        // 4 FuncGens per voice. Rate index:
+        //   0-6  = sync (kFgRateMults[idx] × master phasor delta)
+        //   7-13 = free Hz (kFgFreeRateHz[idx-7], independent of BPM)
+        static constexpr int kNumFuncGens = 4;
+        int   fgRateIdx[kNumFuncGens] = { 4, 4, 4, 4 };  // index into kFgRateNames (default=1 bar sync)
+        int   fgDest[kNumFuncGens]    = { 0, 0, 0, 0 };   // ModDest index
+        float fgDepth[kNumFuncGens]   = { 0.f, 0.f, 0.f, 0.f };  // -1 → +1
+        float fgMin[kNumFuncGens]     = { 0.f, 0.f, 0.f, 0.f };   // normalised range lo
+        float fgMax[kNumFuncGens]     = { 1.f, 1.f, 1.f, 1.f };   // normalised range hi
     };
 
     //==========================================================================
@@ -97,7 +98,12 @@ public:
         voicePhaseAccum_  = 0.0;
         lastTransformedPhase_ = 0.0;
         for (int i = 0; i < Params::kNumFuncGens; ++i)
+        {
             fgPhaseAccum_[i] = 0.0;
+            fgPhaseOut_[i].store (0.f, std::memory_order_relaxed);
+        }
+        for (int d = 0; d < kNumModDests; ++d)
+            destModNorm_[d].store (-1.f, std::memory_order_relaxed);
         voice_.prepare (sampleRate, maxBlockSize);
     }
 
@@ -164,23 +170,34 @@ public:
         // ── Accumulate FuncGen phases (independent of voice rate) ────────────
         for (int i = 0; i < Params::kNumFuncGens; ++i)
         {
-            fgPhaseAccum_[i] += inputDelta * (double) params.fgRate[i];
+            int rateIdx = params.fgRateIdx[i];
+            if (rateIdx < kNumFgSyncRates)
+                fgPhaseAccum_[i] += inputDelta * (double) kFgRateMults[rateIdx];
+            else
+                fgPhaseAccum_[i] += (double) kFgFreeRateHz[rateIdx - kNumFgSyncRates]
+                                    * (double) numSamples / sampleRate_;
             while (fgPhaseAccum_[i] >= 1.0) fgPhaseAccum_[i] -= 1.0;
+            fgPhaseOut_[i].store ((float) fgPhaseAccum_[i], std::memory_order_relaxed);
         }
 
         // ── Build mutable granular params (loop anchor may be overridden) ────────
         GranularVoice::Params gran = params.granular;
 
         // ── Apply FuncGen modulation to gran params ───────────────────────────
+        // Clear mod output per dest first (last FG wins if multiple target same dest)
+        for (int d = 0; d < (int) ModDest::kCount; ++d)
+            destModNorm_[d].store (-1.f, std::memory_order_relaxed);  // -1 = inactive
+
         for (int i = 0; i < Params::kNumFuncGens; ++i)
         {
             auto dest = (ModDest) params.fgDest[i];
             if (dest == ModDest::None || params.fgDepth[i] == 0.0f) continue;
 
-            float raw    = funcGens_[i].evaluate ((float) fgPhaseAccum_[i]);
-            float norm   = params.fgMin[i] + raw * (params.fgMax[i] - params.fgMin[i]);
-            float depth  = params.fgDepth[i];
+            float raw   = funcGens_[i].evaluate ((float) fgPhaseAccum_[i]);
+            float norm  = params.fgMin[i] + raw * (params.fgMax[i] - params.fgMin[i]);
+            float depth = params.fgDepth[i];
             applyModDest (gran, params.granular, dest, norm, depth);
+            destModNorm_[(int) dest].store (norm, std::memory_order_relaxed);
         }
 
         // ── Find step crossings in [lastPhase, newPhase) ──────────────────────
@@ -373,6 +390,18 @@ public:
     FuncGen&       getFuncGen (int i)       { return funcGens_[(size_t) i]; }
     const FuncGen& getFuncGen (int i) const { return funcGens_[(size_t) i]; }
 
+    /** Current FuncGen phase [0,1] — written by audio thread, safe to read from timer. */
+    float getFgPhase (int i) const
+    {
+        return fgPhaseOut_[(size_t) i].load (std::memory_order_relaxed);
+    }
+
+    /** Current modulated norm [0,1] for a destination, or -1 if no FG targets it. */
+    float getDestModNorm (ModDest d) const
+    {
+        return destModNorm_[(int) d].load (std::memory_order_relaxed);
+    }
+
     //==========================================================================
     // Message-thread navigation
 
@@ -500,10 +529,14 @@ private:
     FuncGen            funcGens_[Params::kNumFuncGens];
 
     double   sampleRate_           = 44100.0;
-    double   lastInputPhase_       = 0.0;   // for computing master phase delta
-    double   voicePhaseAccum_      = 0.0;   // accumulated voice phase (rate × delta)
+    double   lastInputPhase_       = 0.0;
+    double   voicePhaseAccum_      = 0.0;
     double   lastTransformedPhase_ = 0.0;
-    double   fgPhaseAccum_[Params::kNumFuncGens] = {}; // FuncGen phase accumulators
+    double   fgPhaseAccum_[Params::kNumFuncGens] = {};
+
+    // UI-readable FuncGen state (audio thread writes, timer reads)
+    std::atomic<float> fgPhaseOut_[Params::kNumFuncGens];   // playhead phase per FG
+    std::atomic<float> destModNorm_[kNumModDests];           // active mod norm per dest (-1=off)
     int      lastSeqSteps_         = -1;
     int      lastSeqHits_          = -1;
     int      lastSeqRotation_      = -1;
