@@ -8,9 +8,10 @@
  * W2SamplerProcessor — Phase 1 (phasor-based, 3 voices).
  *
  * Global param: bpm
- * Per-voice (30 params × 3 = 90): rate, phaseOffset, warp, reverse, quantiseAmt,
+ * Per-voice (33 params × 3 = 99): rate, phaseOffset, warp, reverse, quantiseAmt,
  *   phaseSource, seqSteps, seqHits, seqRotation, sampleAdv, rndFxChance,
- *   pitch, ADSR, filterFreq/Res, distDrive, reverbMix/Size/Freeze, gain,
+ *   pitch, ADSR, filterFreq/Res, distDrive, reverbMix/Size/Freeze,
+ *   preGain, gain, limitThresh,
  *   regionStart/End, loopMode, loopStart/End, loopSizeMs, loopSizeLock.
  *
  * Parameter IDs use v0_/v1_/v2_ prefixes — never rename (DAW project compatibility).
@@ -49,12 +50,16 @@ public:
         juce::AudioParameterFloat* filterFreq   = nullptr; // 20–20000 Hz
         juce::AudioParameterFloat* filterRes    = nullptr; // 0.5–10.0
 
+        // Gain structure
+        juce::AudioParameterFloat* preGain      = nullptr; // pre-amp before drive (0.25–4.0)
+        juce::AudioParameterFloat* gain         = nullptr; // post-FX track level (0.0–2.0)
+        juce::AudioParameterFloat* limitThresh  = nullptr; // per-voice limiter dB (-24–0, 0=bypass)
+
         // Distortion + Reverb
         juce::AudioParameterFloat* distDrive    = nullptr;
         juce::AudioParameterFloat* reverbMix    = nullptr;
         juce::AudioParameterFloat* reverbSize   = nullptr;
         juce::AudioParameterBool*  reverbFreeze = nullptr;
-        juce::AudioParameterFloat* gain         = nullptr;
 
         // Region + Loop
         juce::AudioParameterFloat* regionStart  = nullptr;
@@ -94,9 +99,30 @@ public:
 
     //==========================================================================
     // Public params
-    juce::AudioParameterFloat* bpm    = nullptr;
-    juce::AudioParameterInt*   clkDiv = nullptr;  // beats per phasor cycle: 1,2,4,8
+    juce::AudioParameterFloat* bpm        = nullptr;
+    juce::AudioParameterInt*   clkDiv     = nullptr;  // beats per phasor cycle: 1,2,4,8
+    juce::AudioParameterFloat* masterGain = nullptr;
     VoiceParamPtrs vp[3];
+
+    //==========================================================================
+    // Preset system (8 slots per voice)
+    struct VoicePreset
+    {
+        bool valid = false;
+        // FX params only (the 10 randomizable params + preGain + limitThresh)
+        float pitch      = 0.0f;
+        float attack     = 0.005f, decay = 0.1f, sustain = 0.8f, release_ = 0.2f;
+        float filterFreq = 20000.0f, filterRes = 0.707f;
+        float distDrive  = 0.0f;
+        float reverbMix  = 0.0f, reverbSize = 0.5f;
+        float preGain    = 1.0f;
+        float gain       = 1.0f;
+        float limitThresh = 0.0f;
+    };
+    VoicePreset presets_[3][8];
+
+    void saveVoicePreset (int v, int slot);
+    void loadVoicePreset (int v, int slot);
 
     //==========================================================================
     // Message-thread API
@@ -104,14 +130,35 @@ public:
     void prevSample      (int v);
     void nextSample      (int v);
     void randomSample    (int v);
-    void randomizeVoiceParams (int v);
 
-    /** Check if any voice requested FX randomize on the last block; fire if so.
-     *  Call from the editor's 20fps timer. Thread-safe (atomic exchange). */
-    void checkAndFireRandomizations();
+    /** Re-run onset detection on all samples for voice v with new sensitivity. Message thread only. */
+    void reanalyseOnsets (int v, float sensitivity);
+
+    /** Randomize FX params for voice v.
+     *  locked[10]: if non-null, locked[i]==true means param i is skipped.
+     *  Order: pitch(0) attack(1) decay(2) sustain(3) release(4)
+     *         filterFreq(5) filterRes(6) distDrive(7) reverbMix(8) reverbSize(9).
+     */
+    void randomizeVoiceParams (int v, const bool* locked = nullptr);
+
+    /** Reset all FX params for voice v to default values. */
+    void resetVoiceFX (int v);
+
+    /** Returns true (and clears the flag) if voice v had a hit-triggered FX randomize request.
+     *  Call from the editor's timer so the editor can pass its own lock mask. */
+    bool takeRandomizeFXRequest (int v);
 
     void setPlaying (bool p);
     bool getPlaying() const { return isPlaying_.load(); }
+
+    float getOutputPeakL() const { return outputPeakL_.load (std::memory_order_relaxed); }
+    float getOutputPeakR() const { return outputPeakR_.load (std::memory_order_relaxed); }
+    void  decayOutputPeaks()
+    {
+        outputPeakL_.store (outputPeakL_.load (std::memory_order_relaxed) * 0.97f, std::memory_order_relaxed);
+        outputPeakR_.store (outputPeakR_.load (std::memory_order_relaxed) * 0.97f, std::memory_order_relaxed);
+    }
+    float getShortTermLufs() const { return shortTermLufs_.load (std::memory_order_relaxed); }
 
     // Mute / solo (non-serialised live state)
     void setVoiceMute (int v, bool muted);
@@ -130,9 +177,28 @@ private:
     VoiceChannel voices_[3];
     juce::AudioFormatManager formatManager_;
     double sampleRate_ = 44100.0;
-    std::atomic<bool> isPlaying_    { false };
-    std::atomic<bool> voiceMuted_[3];
-    std::atomic<int>  soloVoice_    { -1 };
+    std::atomic<bool>  isPlaying_    { false };
+    std::atomic<bool>  voiceMuted_[3];
+    std::atomic<int>   soloVoice_    { -1 };
+    std::atomic<float> outputPeakL_ { 0.0f };
+    std::atomic<float> outputPeakR_ { 0.0f };
+
+    // K-weighting filter state (BS.1770, two stages × stereo)
+    struct Biquad {
+        float b0=1,b1=0,b2=0, a1=0,a2=0, z1=0,z2=0;
+        float process (float x) noexcept {
+            float y = b0*x + z1;
+            z1 = b1*x - a1*y + z2;
+            z2 = b2*x - a2*y;
+            return y;
+        }
+        void reset() { z1 = z2 = 0.0f; }
+    };
+    Biquad kw1_[2], kw2_[2];   // stage1 and stage2 per channel
+    float  lufsBlockBuf_[64] = {};  // circular buffer of block mean-squares
+    int    lufsBlockPos_      = 0;
+    float  lufsBlockFill_     = 0;  // how many blocks are filled (up to 64)
+    std::atomic<float> shortTermLufs_ { -70.0f };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (W2SamplerProcessor)
 };

@@ -2,6 +2,7 @@
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_audio_formats/juce_audio_formats.h>
 #include "OnsetDetector.h"
+#include "KeyDetector.h"
 
 /**
  * SampleLibrary — manages a folder of one-shot audio files.
@@ -39,6 +40,14 @@ public:
         // Empty until explicitly requested — onset analysis is expensive.
         OnsetDetector::Result    onsets;    // onset positions (normalised 0–1) + estimated BPM
         bool                     onsetsAnalysed = false; // true once analyseOnsets() has run
+
+        // Key detection results (populated alongside onsets)
+        KeyDetector::Result detectedKey;
+        bool                keyAnalysed = false;
+
+        // Level analysis (computed on load)
+        float peakDb = -96.0f;   // peak level in dBFS
+        float rmsDb  = -96.0f;   // RMS level in dBFS
     };
 
     static constexpr int kMaxSamples = 128;  // safety cap
@@ -85,6 +94,25 @@ public:
             reader->read (&e->buffer, 0, (int) reader->lengthInSamples, 0,
                           /*readLeft=*/ true, /*readRight=*/ true);
 
+            // Compute peak and RMS
+            {
+                double sumSq = 0.0;
+                float  peak  = 0.0f;
+                int    ns    = e->buffer.getNumSamples();
+                int    nc    = e->buffer.getNumChannels();
+                for (int s = 0; s < ns; ++s)
+                    for (int c = 0; c < nc; ++c)
+                    {
+                        float v = e->buffer.getSample (c, s);
+                        peak = std::max (peak, std::abs (v));
+                        sumSq += (double)(v * v);
+                    }
+                e->peakDb = peak > 0.0f ? 20.0f * std::log10 (peak) : -96.0f;
+                float rms = (ns > 0 && nc > 0)
+                    ? (float) std::sqrt (sumSq / (double)(ns * nc)) : 0.0f;
+                e->rmsDb  = rms  > 0.0f ? 20.0f * std::log10 (rms)  : -96.0f;
+            }
+
             entries_.push_back (std::move (e));
             ++loaded;
         }
@@ -108,6 +136,8 @@ public:
 
         e->onsets         = OnsetDetector::analyse (e->buffer, e->sampleRate, sensitivity);
         e->onsetsAnalysed = true;
+        e->detectedKey    = KeyDetector::analyse (e->buffer, e->sampleRate);
+        e->keyAnalysed    = true;
         return true;
     }
 

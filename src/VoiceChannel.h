@@ -81,7 +81,10 @@ public:
     //==========================================================================
     void prepare (double sampleRate, int maxBlockSize)
     {
-        sampleRate_ = sampleRate;
+        sampleRate_       = sampleRate;
+        lastInputPhase_   = 0.0;
+        voicePhaseAccum_  = 0.0;
+        lastTransformedPhase_ = 0.0;
         voice_.prepare (sampleRate, maxBlockSize);
     }
 
@@ -109,16 +112,30 @@ public:
                        int startSample,
                        int numSamples)
     {
-        // ── Build PhaseTransform ──────────────────────────────────────────────
+        // ── Accumulate voice phase via delta × rate ───────────────────────────
+        // Rate must be applied to the INCREMENT, not the instantaneous master
+        // phase value.  Multiplying master phase directly caps the range to
+        // [0, rate) when rate < 1, so e.g. /2 only ever crosses steps 0–7.
+        // By accumulating delta × rate we always sweep the full 0→1 range —
+        // /2 just takes twice as many master cycles to get there.
+        double inputDelta = inputPhase - lastInputPhase_;
+        if (inputDelta < 0.0) inputDelta += 1.0;   // handle master clock wrap
+        lastInputPhase_ = inputPhase;
+
+        voicePhaseAccum_ += inputDelta * (double) params.rate;
+        while (voicePhaseAccum_ >= 1.0) voicePhaseAccum_ -= 1.0;
+
+        // ── Apply remaining phase transforms (offset / warp / reverse / quant)
+        // Rate is already baked in above — pass rateMultiplier = 1.
         PhaseTransform pt;
-        pt.rateMultiplier = params.rate;
+        pt.rateMultiplier = 1.0f;
         pt.phaseOffset    = params.phaseOffset;
         pt.warp           = params.warp;
         pt.reverse        = params.reverse;
         pt.quantiseAmount = params.quantiseAmount;
         pt.stepsForQuant  = params.seqSteps;
 
-        double newPhase = pt.apply (inputPhase);
+        double newPhase = pt.apply (voicePhaseAccum_);
 
         // ── Rebuild euclidean pattern only when changed ───────────────────────
         if (params.seqSteps    != lastSeqSteps_    ||
@@ -155,15 +172,74 @@ public:
                                       ? library_.current()->buffer.getNumSamples() : 0;
 
                     if (bufLen > 0 && sampleRate_ > 0.0 &&
+                        (loopMode == GranularVoice::LoopMode::OnsetSeq ||
+                         loopMode == GranularVoice::LoopMode::OnsetRnd))
+                    {
+                        float loopFrac = (float)(gran.loopSizeMs / 1000.0 * sampleRate_ / bufLen);
+                        loopFrac = juce::jlimit (0.001f, 1.0f, loopFrac);
+                        float rgnSt = gran.regionStart;
+                        float rgnEn = gran.regionEnd;
+
+                        auto* entry = library_.current();
+                        bool  found = false;
+
+                        if (entry && entry->onsetsAnalysed && entry->onsets.count > 0)
+                        {
+                            const auto& ov = entry->onsets.positions;
+                            int nOnsets = (int) ov.size();
+
+                            if (loopMode == GranularVoice::LoopMode::OnsetSeq)
+                            {
+                                ++onsetIdx_;
+                                for (int tries = 0; tries < nOnsets; ++tries)
+                                {
+                                    int idx = ((onsetIdx_ + tries) % nOnsets + nOnsets) % nOnsets;
+                                    float pos = ov[(size_t) idx];
+                                    if (pos >= rgnSt && pos + loopFrac <= rgnEn)
+                                    {
+                                        seqLoopAnchorNorm_ = pos;
+                                        onsetIdx_ = idx;
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            else // OnsetRnd
+                            {
+                                audioRng_ = audioRng_ * 1664525u + 1013904223u;
+                                int startIdx = (int)((audioRng_ >> 16) % (uint32_t) nOnsets);
+                                for (int tries = 0; tries < nOnsets; ++tries)
+                                {
+                                    int idx = (startIdx + tries) % nOnsets;
+                                    float pos = ov[(size_t) idx];
+                                    if (pos >= rgnSt && pos + loopFrac <= rgnEn)
+                                    {
+                                        seqLoopAnchorNorm_ = pos;
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!found)
+                        {
+                            // No valid onset — fall back to random position in region
+                            audioRng_ = audioRng_ * 1664525u + 1013904223u;
+                            float frac = (float)(audioRng_ >> 16) / 65535.0f;
+                            float maxAnch = rgnEn - loopFrac;
+                            if (maxAnch < rgnSt) maxAnch = rgnSt;
+                            seqLoopAnchorNorm_ = rgnSt + frac * (maxAnch - rgnSt);
+                        }
+                        seqLoopEndNorm_ = seqLoopAnchorNorm_ + loopFrac;
+                    }
+                    else if (bufLen > 0 && sampleRate_ > 0.0 &&
                         (loopMode == GranularVoice::LoopMode::Sequential ||
                          loopMode == GranularVoice::LoopMode::Random))
                     {
-                        // loopStart/loopEnd are absolute [0,1] of full buffer
-                        float loopFrac;
-                        if (gran.loopSizeLock)
-                            loopFrac = (float)(gran.loopSizeMs / 1000.0 * sampleRate_ / bufLen);
-                        else
-                            loopFrac = gran.loopEnd - gran.loopStart;
+                        // In Rnd/Seq, always use loopSizeMs for grain size.
+                        // The handles define the playback region boundary, not the grain size.
+                        float loopFrac = (float)(gran.loopSizeMs / 1000.0 * sampleRate_ / bufLen);
                         loopFrac = juce::jlimit (0.001f, 1.0f, loopFrac);
 
                         float rgnSt    = gran.regionStart;
@@ -183,13 +259,16 @@ public:
                             float frac = (float)(audioRng_ >> 16) / 65535.0f;
                             seqLoopAnchorNorm_ = rgnSt + frac * (maxAnch - rgnSt);
                         }
+                        seqLoopEndNorm_ = seqLoopAnchorNorm_ + loopFrac;
                     }
                     else
                     {
-                        // Fixed/Off: anchor follows the waveform handle
+                        // Fixed/Off: anchor and end follow the waveform handles
                         seqLoopAnchorNorm_ = gran.loopStart;
+                        seqLoopEndNorm_    = gran.loopEnd;
                     }
                     gran.loopStart = seqLoopAnchorNorm_;
+                    gran.loopEnd   = seqLoopEndNorm_;
                 }
 
                 // ── Sample file advance ───────────────────────────────────────
@@ -226,8 +305,9 @@ public:
             currentStep_.store ((int)(newPhase * params.seqSteps) % params.seqSteps);
         lastTransformedPhase_ = newPhase;
 
-        // ── Keep gran.loopStart in sync for one-shot rendering too ───────────────
+        // ── Keep gran.loopStart/End in sync for rendering ────────────────────────
         gran.loopStart = seqLoopAnchorNorm_;
+        gran.loopEnd   = seqLoopEndNorm_;
         // Expose for waveform cursor
         seqLoopAnchorDisplay_.store (seqLoopAnchorNorm_, std::memory_order_relaxed);
 
@@ -268,7 +348,13 @@ private:
     void loadCurrentSampleIntoVoice()
     {
         auto* e = library_.current();
-        if (e) voice_.loadBuffer (&e->buffer, e->sampleRate);
+        if (e)
+        {
+            voice_.loadBuffer (&e->buffer, e->sampleRate);
+            seqLoopAnchorNorm_ = 0.0f;
+            seqLoopEndNorm_    = 0.25f;
+            onsetIdx_          = -1;
+        }
     }
 
     void swapCurrentSampleIntoVoice()
@@ -277,7 +363,9 @@ private:
         if (e)
         {
             voice_.swapBuffer (&e->buffer, e->sampleRate);
-            seqLoopAnchorNorm_ = 0.0f;   // reset loop position on file change
+            seqLoopAnchorNorm_ = 0.0f;
+            seqLoopEndNorm_    = 1.0f;
+            onsetIdx_          = -1;
         }
     }
 
@@ -286,6 +374,8 @@ private:
     EuclideanSequencer sequencer_;
 
     double   sampleRate_           = 44100.0;
+    double   lastInputPhase_       = 0.0;   // for computing master phase delta
+    double   voicePhaseAccum_      = 0.0;   // accumulated voice phase (rate × delta)
     double   lastTransformedPhase_ = 0.0;
     int      lastSeqSteps_         = -1;
     int      lastSeqHits_          = -1;
@@ -294,6 +384,8 @@ private:
 
     // Loop position sequencer state (audio thread)
     float seqLoopAnchorNorm_ = 0.0f;
+    float seqLoopEndNorm_    = 1.0f;  // loopEnd kept in sync with anchor
+    int   onsetIdx_          = -1;    // current onset index for OnsetSeq mode
 
     // UI-readable (written by audio thread, read by UI timer)
     std::atomic<double> transformedPhase_     { 0.0 };

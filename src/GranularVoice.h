@@ -5,19 +5,21 @@
 /**
  * GranularVoice — region-based looping sample voice with full DSP chain.
  *
- * Extends the previous W2SamplerVoice with:
- *   - Play region (regionStart → regionEnd within the sample buffer)
- *   - Four loop modes (Off / Fixed / Random / Sequential)
- *   - Loop size lock in milliseconds
- *   - Same DSP chain (ADSR → distortion → LP filter → reverb)
+ * DSP chain (per renderBlock):
+ *   Sample read (linear interp, pitch ratio, region clamp, loop logic)
+ *     → ADSR envelope
+ *     → Anti-click trigger fade  (5ms linear ramp on each trigger)
+ *     → Pre-amp gain             (params.preGain — into drive)
+ *     → tanh distortion          (normalised)
+ *     → StateVariableTPT LP filter
+ *     → Reverb
+ *     → Per-voice Limiter        (params.limitThreshDb; 0 = bypassed)
+ *     → Track level × velocity  (params.gain — post-FX output level)
  *
- * One-shot behaviour = LoopMode::Off (default).
- * "Granular" = LoopMode::Random with a short loopSizeMs (5–200ms).
+ * ALL loop/region values stored as normalised [0,1] fractions of the buffer.
+ * loopSizeMs is in milliseconds; conversion happens at render time.
  *
- * ALL values stored as normalised [0,1] fractions of the buffer length,
- * except loopSizeMs which is in milliseconds. Conversion happens at render time.
- *
- * Thread safety: same as W2SamplerVoice.
+ * Thread safety:
  *   prepare()     — before audio starts
  *   loadBuffer()  — message thread only
  *   swapBuffer()  — audio thread only (pointer swap, no alloc)
@@ -27,7 +29,7 @@
 class GranularVoice
 {
 public:
-    enum class LoopMode { Off = 0, Fixed = 1, Random = 2, Sequential = 3 };
+    enum class LoopMode { Off = 0, Fixed = 1, Random = 2, Sequential = 3, OnsetSeq = 4, OnsetRnd = 5 };
 
     struct Params
     {
@@ -50,6 +52,11 @@ public:
         float reverbSize   = 0.5f;
         bool  reverbFreeze = false;
 
+        // Gain structure
+        float preGain       = 1.0f;   // pre-amp: applied BEFORE drive  (0.25–4.0)
+        float gain          = 1.0f;   // track level: post-FX output    (0.0–2.0)
+        float limitThreshDb = 0.0f;   // per-voice limiter threshold dB (0 = bypass)
+
         // Region (normalised 0–1)
         float regionStart = 0.0f;
         float regionEnd   = 1.0f;
@@ -60,9 +67,6 @@ public:
         float    loopEnd     = 1.0f;   // normalised; ignored if loopSizeLock=true
         float    loopSizeMs  = 100.0f; // used when loopSizeLock=true
         bool     loopSizeLock = false; // if true, loopEnd = loopStart + loopSizeMs
-
-        // Output
-        float gain = 1.0f;
     };
 
     //==========================================================================
@@ -92,9 +96,14 @@ public:
         rp.width = 1.0f;    rp.freezeMode = 0.0f;
         reverb_.setParameters (rp);
 
-        position_  = 0.0;
-        playing_   = false;
-        exhausted_ = false;
+        limiter_.prepare (spec);
+        limiter_.setThreshold (-1.0f);
+        limiter_.setRelease   (100.0f);
+
+        position_             = 0.0;
+        playing_              = false;
+        exhausted_            = false;
+        triggerFadeRemaining_ = 0;
     }
 
     /** Message thread: set or replace the source buffer. Full state reset. */
@@ -122,10 +131,8 @@ public:
         velocity_  = velocity;
         exhausted_ = false;
         playing_   = true;
-        // Will be positioned at regionStart on first renderBlock call
-        // We flag this with a "needs reset" bool so that position is
-        // set correctly even if trigger() is called mid-block
         needsPositionReset_ = true;
+        triggerFadeRemaining_ = kTriggerFadeSamples;
         adsr_.noteOn();
     }
 
@@ -137,8 +144,7 @@ public:
 
     bool isPlaying() const { return playing_; }
 
-    /** UI thread: normalised [0,1] position within the full sample buffer.
-     *  Atomic — safe to read from message thread while audio thread renders. */
+    /** UI thread: normalised [0,1] position within the full sample buffer. */
     float getPlayPositionNorm() const { return playPosNorm_.load (std::memory_order_relaxed); }
 
     //==========================================================================
@@ -146,7 +152,7 @@ public:
                       int startSample, int numSamples,
                       double playbackRate,
                       const Params& params,
-                      uint32_t& /*rngState*/)  // reserved for future per-grain randomization
+                      uint32_t& /*rngState*/)
     {
         if (!playing_) return;
         numSamples = std::min (numSamples, tempBuf_.getNumSamples());
@@ -166,7 +172,7 @@ public:
         rp.dryLevel   = 1.0f;
         rp.width      = 1.0f;
         rp.freezeMode = params.reverbFreeze ? 1.0f : 0.0f;
-        reverb_.setParameters (rp);   // audio-thread only — always safe here
+        reverb_.setParameters (rp);
 
         // ── Resolve region + loop boundaries (samples) ───────────────────────
         int   srcLen   = (buffer_ != nullptr) ? buffer_->getNumSamples() : 0;
@@ -177,8 +183,6 @@ public:
         if (rgnEnd   <= rgnStart) rgnEnd   = rgnStart + 1.0;
         rgnEnd   = std::min (rgnEnd,   (double)(srcLen - 1));
 
-        // Loop bounds — loopStart/loopEnd are absolute [0,1] fractions of the
-        // full buffer (same coordinate space as the waveform display).
         double loopSizeSamples = (double) params.loopSizeMs * sourceRate_ / 1000.0;
         double lStart, lEnd;
 
@@ -194,15 +198,13 @@ public:
             if (lEnd <= lStart) lEnd = lStart + 1.0;
         }
 
-        // Clamp loop window to region
         lStart = std::max (lStart, rgnStart);
         lEnd   = std::min (lEnd,   rgnEnd);
         if (lEnd <= lStart) lEnd = lStart + 1.0;
 
-        // Position the playhead on first trigger — always start at the loop window
         if (needsPositionReset_)
         {
-            position_           = lStart;   // play FROM loop start, not file start
+            position_           = lStart;
             loopAnchorSamples_  = lStart;
             needsPositionReset_ = false;
         }
@@ -211,7 +213,6 @@ public:
         double pitchRatio    = std::pow (2.0, (double) params.pitchSemitones / 12.0);
         double effectiveStep = (sourceRate_ / playbackRate) * pitchRatio;
 
-        // ── Update UI-readable playback position ──────────────────────────────
         if (srcLen > 0)
             playPosNorm_.store ((float)(position_ / srcLen), std::memory_order_relaxed);
 
@@ -224,16 +225,16 @@ public:
         {
             if (!exhausted_)
             {
-                // ── Loop logic: handle reaching the loop end ─────────────────
                 bool pastLoopEnd = (position_ >= lEnd);
                 bool pastRgnEnd  = (position_ >= rgnEnd);
 
-                // One-shot: stop at loop end; looping: wrap within current window.
-                // Window position movement (Seq/Rnd) is handled by VoiceChannel
-                // on each euclidean trigger — not here.
-                if (pastLoopEnd && params.loopMode != LoopMode::Off)
+                // OnsetSeq/OnsetRnd: one-shot per trigger — do NOT loop internally.
+                // The sequencer in VoiceChannel advances the anchor on each hit.
+                bool canLoop = params.loopMode != LoopMode::Off
+                            && params.loopMode != LoopMode::OnsetSeq
+                            && params.loopMode != LoopMode::OnsetRnd;
+                if (pastLoopEnd && canLoop)
                 {
-                    // All looping modes: seamlessly wrap within the current window
                     double span = lEnd - loopAnchorSamples_;
                     if (span < 1.0) span = 1.0;
                     position_ = loopAnchorSamples_
@@ -241,7 +242,6 @@ public:
                 }
                 else if (pastLoopEnd || pastRgnEnd)
                 {
-                    // Off mode or past entire region → release
                     exhausted_ = true;
                     adsr_.noteOff();
                 }
@@ -249,7 +249,6 @@ public:
 
             if (!exhausted_ && position_ < (double)(srcLen - 1))
             {
-                // Linear interpolation read
                 int   a    = (int) position_;
                 int   b    = std::min (a + 1, srcLen - 1);
                 float frac = (float)(position_ - a);
@@ -263,7 +262,6 @@ public:
                 }
                 position_ += effectiveStep;
             }
-            // else: silence (exhausted but ADSR still releasing — reverb tail)
         }
 
         // ── ADSR envelope ─────────────────────────────────────────────────────
@@ -276,16 +274,38 @@ public:
             return;
         }
 
+        // ── Anti-click: linear fade-in on each trigger (~5ms) ─────────────────
+        if (triggerFadeRemaining_ > 0)
+        {
+            int sampleOffset = kTriggerFadeSamples - triggerFadeRemaining_;
+            int n = std::min (numSamples, triggerFadeRemaining_);
+            for (int i = 0; i < n; ++i)
+            {
+                float t = (float)(sampleOffset + i) / (float)kTriggerFadeSamples;
+                for (int ch = 0; ch < dstChans; ++ch)
+                    tempBuf_.setSample (ch, i, tempBuf_.getSample (ch, i) * t);
+            }
+            triggerFadeRemaining_ -= n;
+        }
+
+        // ── Pre-amp gain (before drive) ───────────────────────────────────────
+        if (std::abs (params.preGain - 1.0f) > 0.001f)
+        {
+            for (int ch = 0; ch < dstChans; ++ch)
+                juce::FloatVectorOperations::multiply (
+                    tempBuf_.getWritePointer (ch), params.preGain, numSamples);
+        }
+
         // ── Distortion ────────────────────────────────────────────────────────
         if (params.distDrive > 0.001f)
         {
-            float preGain  = 1.0f + params.distDrive * 9.0f;
-            float postGain = 1.0f / std::tanh (preGain);
+            float preGainDrv  = 1.0f + params.distDrive * 9.0f;
+            float postGainDrv = 1.0f / std::tanh (preGainDrv);
             for (int ch = 0; ch < dstChans; ++ch)
             {
                 float* d = tempBuf_.getWritePointer (ch);
                 for (int i = 0; i < numSamples; ++i)
-                    d[i] = std::tanh (d[i] * preGain) * postGain;
+                    d[i] = std::tanh (d[i] * preGainDrv) * postGainDrv;
             }
         }
 
@@ -308,7 +328,18 @@ public:
                                    tempBuf_.getWritePointer (1), numSamples);
         }
 
-        // ── Mix into output ───────────────────────────────────────────────────
+        // ── Per-voice limiter ─────────────────────────────────────────────────
+        if (params.limitThreshDb < -0.5f)
+        {
+            limiter_.setThreshold (params.limitThreshDb);
+            juce::dsp::AudioBlock<float> block (
+                tempBuf_.getArrayOfWritePointers(),
+                (size_t) dstChans, 0, (size_t) numSamples);
+            juce::dsp::ProcessContextReplacing<float> ctx (block);
+            limiter_.process (ctx);
+        }
+
+        // ── Mix into output (params.gain = post-FX track level) ───────────────
         float finalGain = params.gain * velocity_;
         int   outChans  = output.getNumChannels();
         for (int ch = 0; ch < outChans; ++ch)
@@ -323,14 +354,19 @@ private:
     double sourceRate_       = 44100.0;
     double sampleRate_       = 44100.0;
     double position_         = 0.0;
-    double loopAnchorSamples_ = 0.0;   // current loop start in samples (updated by loop modes)
+    double loopAnchorSamples_ = 0.0;
     float  velocity_         = 1.0f;
     bool   playing_          = false;
     bool   exhausted_        = false;
     bool   needsPositionReset_ = false;
 
+    // Anti-click: linear fade-in over ~5ms on each trigger
+    int triggerFadeRemaining_ = 0;
+    static constexpr int kTriggerFadeSamples = 220;  // ~5ms @ 44.1kHz
+
     juce::ADSR                               adsr_;
     juce::dsp::StateVariableTPTFilter<float> filter_;
     juce::Reverb                             reverb_;
+    juce::dsp::Limiter<float>                limiter_;
     juce::AudioBuffer<float>                 tempBuf_;
 };
