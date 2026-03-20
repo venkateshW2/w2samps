@@ -141,6 +141,17 @@ public:
         return lut_[buf][idx];
     }
 
+    /** Smooth evaluate using linear interpolation between LUT entries (for display). */
+    float evaluateSmooth (float phase) const noexcept
+    {
+        int buf = readBuf_.load (std::memory_order_acquire);
+        float t = std::max (0.f, std::min (1.f, phase)) * (float)(kLutSize - 1);
+        int   i0 = (int) t;
+        int   i1 = std::min (i0 + 1, kLutSize - 1);
+        float fr = t - (float) i0;
+        return lut_[buf][i0] * (1.f - fr) + lut_[buf][i1] * fr;
+    }
+
     //==========================================================================
     // Serialisation helpers (called by PluginProcessor state I/O)
 

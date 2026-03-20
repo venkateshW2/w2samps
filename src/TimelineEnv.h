@@ -105,6 +105,17 @@ public:
 
         if (isPlaying && active_)
         {
+            // Process any pending seek request
+            {
+                float seek = seekRequest_.load (std::memory_order_relaxed);
+                if (seek >= 0.f)
+                {
+                    float dur = durationSec.load (std::memory_order_relaxed);
+                    timeSec_ = (double) seek * (double) dur;
+                    currentPhase_.store (seek, std::memory_order_relaxed);
+                    seekRequest_.store (-1.f, std::memory_order_relaxed);
+                }
+            }
             float dur = durationSec.load (std::memory_order_relaxed);
             if (dur < 0.001f) dur = 0.001f;
             float rate = rateMultiplier.load (std::memory_order_relaxed);
@@ -120,6 +131,17 @@ public:
             float norm = (float) (timeSec_ / (double) dur);
             currentPhase_.store (norm, std::memory_order_relaxed);
         }
+        // Also handle seek when not playing
+        {
+            float seek = seekRequest_.load (std::memory_order_relaxed);
+            if (seek >= 0.f)
+            {
+                float dur = durationSec.load (std::memory_order_relaxed);
+                timeSec_ = (double) seek * (double) dur;
+                currentPhase_.store (seek, std::memory_order_relaxed);
+                seekRequest_.store (-1.f, std::memory_order_relaxed);
+            }
+        }
         return currentPhase_.load (std::memory_order_relaxed);
     }
 
@@ -131,6 +153,12 @@ public:
     /** Destinations the audio thread uses for modulation. */
     const std::vector<TimelineDest>& getActiveDests() const noexcept { return activeDests_; }
 
+    /** Message thread: seek to normalised position on next audio tick. Thread-safe. */
+    void seekToPhase (float norm)
+    {
+        seekRequest_.store (std::max (0.f, std::min (1.f, norm)), std::memory_order_relaxed);
+    }
+
     void resetTime() { timeSec_ = 0.0; currentPhase_.store (0.f, std::memory_order_relaxed); }
 
 private:
@@ -138,6 +166,7 @@ private:
     double timeSec_   = 0.0;
 
     std::atomic<float> currentPhase_ { 0.f };
+    std::atomic<float> seekRequest_ { -1.f };  // -1 = no pending seek
     std::atomic<bool>  destsChanged_ { false };
 
     // Destination lists — pendingDests_ written by message thread,

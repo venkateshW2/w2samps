@@ -1176,8 +1176,9 @@ void W2SamplerEditor::paint (juce::Graphics& g)
     g.setColour (juce::Colour (kPanel));
     g.fillRect (0, bottomY, W - kRightW, kBottomH);
 
-    // Center ring area
-    drawRings (g);
+    // Center ring area (hidden when timeline is open)
+    if (!showTimeline_)
+        drawRings (g);
 
     // Master column
     drawMasterColumn (g);
@@ -1212,13 +1213,6 @@ void W2SamplerEditor::drawRings (juce::Graphics& g)
                        (r + trackWidth*0.5f)*2, (r + trackWidth*0.5f)*2, 1.0f);
         g.drawEllipse (cx - r + trackWidth*0.5f, cy - r + trackWidth*0.5f,
                        (r - trackWidth*0.5f)*2, (r - trackWidth*0.5f)*2, 1.0f);
-
-        // Selected ring glow
-        if (sel)
-        {
-            g.setColour (vc.withAlpha (0.08f));
-            g.drawEllipse (cx - r - 4, cy - r - 4, (r+4)*2, (r+4)*2, 6.0f);
-        }
 
         // Step dots
         auto& seq   = proc.getVoice(v).getSequencer();
