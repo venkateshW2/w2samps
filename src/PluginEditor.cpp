@@ -84,6 +84,10 @@ W2SamplerEditor::W2SamplerEditor (W2SamplerProcessor& p)
     for (int v = 0; v < 3; ++v)
         buildVoiceUI (v);
 
+    // Timeline view
+    timelineView_.setProcessor (&proc);
+    addChildComponent (timelineView_);
+
     startTimerHz (20);
     resized();
 }
@@ -133,6 +137,17 @@ void W2SamplerEditor::buildTransportBar()
         };
         addAndMakeVisible (clkDivBtns[i]);
     }
+
+    // Timeline toggle button
+    styleButton (tlToggleBtn);
+    tlToggleBtn.onClick = [this] {
+        showTimeline_ = !showTimeline_;
+        tlToggleBtn.setColour (juce::TextButton::buttonColourId,
+            juce::Colour (showTimeline_ ? kActive : kElevated));
+        resized();
+        repaint();
+    };
+    addAndMakeVisible (tlToggleBtn);
 
     // Mute/Solo buttons — built here, positioned in master column
     for (int v = 0; v < 3; ++v)
@@ -400,6 +415,15 @@ void W2SamplerEditor::buildVoiceUI (int v)
     leftContent_.addAndMakeVisible (ui.gainSlider);    leftContent_.addAndMakeVisible (ui.gainLabel);
     leftContent_.addAndMakeVisible (ui.limitSlider);   leftContent_.addAndMakeVisible (ui.limitLabel);
 
+    styleSlider (ui.smoothSlider, 0.0f, 200.0f, 0.0f);
+    ui.smoothSlider.setDoubleClickReturnValue (true, 0.0);
+    styleLabel  (ui.smoothLabel);
+    ui.smoothSlider.onValueChange = [this, v] {
+        if (proc.vp[v].smoothMs) *proc.vp[v].smoothMs = (float)voiceUI[v].smoothSlider.getValue();
+    };
+    leftContent_.addAndMakeVisible (ui.smoothSlider);
+    leftContent_.addAndMakeVisible (ui.smoothLabel);
+
     // Mod indicator bars — one per ModDest, overlaid below SOUND sliders
     {
         static const juce::Colour voiceColours[] = {
@@ -609,6 +633,23 @@ void W2SamplerEditor::resized()
         ringCY_ = (float)(mainY + mainH / 2);
     }
 
+    // Center content: rings or timeline
+    {
+        int cX = kLeftW;
+        int cW = W - kRightW - kLeftW;
+        int cY = kTransportH;
+        int cH = H - kTransportH - kBottomH;
+        if (showTimeline_)
+        {
+            timelineView_.setBounds (cX, cY, cW, cH);
+            timelineView_.setVisible (true);
+        }
+        else
+        {
+            timelineView_.setVisible (false);
+        }
+    }
+
     // Voice selector row at top of left column (direct editor children)
     {
         const int selBtnW = kLeftW / 3;
@@ -663,6 +704,9 @@ void W2SamplerEditor::layoutTransportBar()
                                  juce::Colour (active ? kActive : kElevated));
     }
 
+    // TL button — rightmost before master column
+    tlToggleBtn.setBounds (x + 4, y + 5, 32, h - 10);
+
     // Mute/Solo hidden from transport — they live in the master column
     for (int v = 0; v < 3; ++v)
     {
@@ -697,7 +741,7 @@ void W2SamplerEditor::layoutMasterColumn()
     }
 
     // Meter bars start below mute/solo section
-    const int barTopY = msStartY + 3 * (msRowH + 3) + 8;
+    const int barTopY = msStartY + 3 * (msRowH + 3) + 40;
     const int barH    = H - barTopY - 36;
 
     // Vertical fader
@@ -748,6 +792,7 @@ void W2SamplerEditor::hideVoiceAll()
         hide (ui.gainSlider);    hide (ui.gainLabel);
         hide (ui.preGainSlider); hide (ui.preGainLabel);
         hide (ui.limitSlider);   hide (ui.limitLabel);
+        hide (ui.smoothSlider);  hide (ui.smoothLabel);
 
         for (auto& b : ui.rndLockBtns) hide (b);
         hide (ui.rndFxSlider);   hide (ui.rndFxLabel);
@@ -949,6 +994,7 @@ void W2SamplerEditor::layoutVoicePanel (int v)
         placeSound (ui.preGainLabel, ui.preGainSlider, ModDest::None);
         placeSound (ui.gainLabel,    ui.gainSlider,    ModDest::None);
         placeSound (ui.limitLabel,   ui.limitSlider,   ModDest::None);
+        placeSound (ui.smoothLabel,  ui.smoothSlider,  ModDest::None);
         y += sectionGap;
     }
 
@@ -1332,19 +1378,19 @@ void W2SamplerEditor::drawMasterColumn (juce::Graphics& g)
         }
     }
 
-    // LUFS — below mute/solo rows: msStartY(4) + 3*(22+3) + 8 = kTransportH+87
-    const int barTopYDraw = kTransportH + 87;
+    // LUFS — below mute/solo rows: msStartY(4) + 3*(22+3) + 40 = kTransportH+119
+    const int barTopYDraw = kTransportH + 119;
     float lufs = proc.getShortTermLufs();
     g.setColour (juce::Colour (kTextDim));
     g.setFont (juce::Font (juce::FontOptions{}.withName ("Menlo").withHeight (9.0f)));
-    g.drawText ("LUFS", mr.getX(), mr.getY() + barTopYDraw - 18, mr.getWidth(), 10,
+    g.drawText ("LUFS", mr.getX(), mr.getY() + barTopYDraw - 32, mr.getWidth(), 10,
                 juce::Justification::centred);
     juce::Colour lufsCol = (lufs > -6.0f)  ? juce::Colour (0xffBB2222) :
                            (lufs > -14.0f) ? juce::Colour (0xffAA8800) :
                                              juce::Colour (0xff336622);
     g.setColour (lufsCol);
     g.setFont (juce::Font (juce::FontOptions{}.withName ("Menlo").withHeight (9.5f)));
-    g.drawText (juce::String (lufs, 1), mr.getX(), mr.getY() + barTopYDraw - 8, mr.getWidth(), 11,
+    g.drawText (juce::String (lufs, 1), mr.getX(), mr.getY() + barTopYDraw - 21, mr.getWidth(), 11,
                 juce::Justification::centred);
 
     // Stereo L/R bars + dB scale — tall meter (matches layoutMasterColumn)
@@ -1384,8 +1430,8 @@ void W2SamplerEditor::drawMasterColumn (juce::Graphics& g)
     // L/R channel labels
     g.setColour (juce::Colour (kText));
     g.setFont (juce::Font (juce::FontOptions{}.withName ("Menlo").withHeight (9.5f)));
-    g.drawText ("L", lx, barY - 14, barW, 12, juce::Justification::centred);
-    g.drawText ("R", rx, barY - 14, barW, 12, juce::Justification::centred);
+    g.drawText ("L", lx, barY - 12, barW, 12, juce::Justification::centred);
+    g.drawText ("R", rx, barY - 12, barW, 12, juce::Justification::centred);
 
     drawVBar (proc.getOutputPeakL(), lx);
     drawVBar (proc.getOutputPeakR(), rx);
@@ -1510,6 +1556,10 @@ void W2SamplerEditor::timerCallback()
         }
     }
 
+    // Timeline view refresh
+    if (showTimeline_)
+        timelineView_.refreshPlayheads();
+
     const int W = getWidth();
     const int H = getHeight();
 
@@ -1586,6 +1636,7 @@ void W2SamplerEditor::syncVoiceFromParams (int v)
     ui.gainSlider.setValue     ((double)p.gain->get(), d);
     ui.preGainSlider.setValue  ((double)p.preGain->get(), d);
     ui.limitSlider.setValue    ((double)p.limitThresh->get(), d);
+    if (p.smoothMs) ui.smoothSlider.setValue ((double)p.smoothMs->get(), d);
     ui.loopMsSlider.setValue   ((double)p.loopSizeMs->get(), d);
     ui.rndFxSlider.setValue    ((double)p.rndFxChance->get(), d);
 

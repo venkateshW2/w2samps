@@ -295,6 +295,443 @@ public:
 
 //==============================================================================
 /**
+ * TimelineView — scrollable multi-lane macro-envelope editor.
+ *
+ * 8 lanes (one per TimelineEnv). Each lane has:
+ *   - Left sidebar (120px): ON/OFF button, LOOP button, duration label (editable),
+ *     +Dest button, Clear button, destination chips showing V1→Pitch etc.
+ *   - Right content: FuncGenCanvas (click to add/drag points, double-click to delete),
+ *     gold playhead, green progress fill.
+ * Lanes scroll vertically inside a Viewport when they exceed the visible area.
+ */
+class TimelineView : public juce::Component
+{
+public:
+    //==========================================================================
+    // Inner scrollable content — holds all per-lane child components
+    struct LanesContent : public juce::Component
+    {
+        void paint (juce::Graphics& g) override
+        {
+            auto b = getLocalBounds();
+            g.setColour (juce::Colour (0xff1C1C1E));
+            g.fillRect (b);
+            // Draw lane separators (each 120px tall)
+            g.setColour (juce::Colour (0xff3A3A3C));
+            for (int i = 1; i <= 8; ++i)
+                g.drawHorizontalLine (i * 120 - 1, 0.f, (float)b.getWidth());
+            // Sidebar background (120px wide)
+            g.setColour (juce::Colour (0xff242426));
+            g.fillRect (0, 0, 120, b.getHeight());
+            // Sidebar right border
+            g.setColour (juce::Colour (0xff48484A));
+            g.drawVerticalLine (120, 0.f, (float)b.getHeight());
+        }
+    };
+
+    //==========================================================================
+    TimelineView()
+    {
+        lanesViewport_.setScrollBarsShown (true, false);
+        lanesViewport_.setViewedComponent (&lanesContent_, false);
+        addAndMakeVisible (lanesViewport_);
+    }
+
+    void setProcessor (W2SamplerProcessor* p)
+    {
+        proc_ = p;
+        buildLaneControls();
+        resized();
+        repaint();
+    }
+
+    void refreshPlayheads()
+    {
+        // Refresh loop/active button colours and repaint lanes
+        if (proc_)
+        {
+            for (int i = 0; i < 8; ++i)
+            {
+                bool act  = proc_->getTimeline(i).isActive();
+                bool loop = proc_->getTimeline(i).looping.load (std::memory_order_relaxed);
+                activeBtn_[i].setColour (juce::TextButton::buttonColourId,
+                    juce::Colour (act ? 0xff30D158u : 0xff3A3A3Cu));
+                loopBtn_[i].setColour (juce::TextButton::buttonColourId,
+                    juce::Colour (loop ? 0xff30D158u : 0xff3A3A3Cu));
+            }
+        }
+        lanesContent_.repaint();
+    }
+
+    //==========================================================================
+    void resized() override
+    {
+        auto b = getLocalBounds();
+
+        // Ruler row at top
+        zoomSlider_.setBounds (b.getRight() - 100, b.getY() + 3, 96, kRulerH - 6);
+
+        // Viewport fills rest below ruler
+        lanesViewport_.setBounds (b.getX(), b.getY() + kRulerH,
+                                  b.getWidth(), b.getHeight() - kRulerH);
+
+        // Content size: always 8 lanes tall, full width
+        lanesContent_.setSize (b.getWidth(), 8 * kLaneH);
+
+        // Per-lane children layout (coordinates relative to lanesContent_)
+        const int cw = b.getWidth() - kSideW - 2;   // curve area width
+        for (int i = 0; i < 8; ++i)
+        {
+            int ly = i * kLaneH;
+            // Sidebar controls
+            activeBtn_[i].setBounds   (3,        ly + 3,  46, 20);
+            loopBtn_[i].setBounds     (53,       ly + 3,  46, 20);
+            durationLabel_[i].setBounds (3,      ly + 27, 110, 18);
+            addDestBtn_[i].setBounds  (3,        ly + kLaneH - 46, 54, 18);
+            clearDestBtn_[i].setBounds (61,      ly + kLaneH - 46, 52, 18);
+            // Curve canvas — takes up the right content area, leaving 22px at bottom for playhead label
+            fgCanvas_[i].setBounds (kSideW + 2, ly + 3, cw - 4, kLaneH - 28);
+        }
+    }
+
+    //==========================================================================
+    void paint (juce::Graphics& g) override
+    {
+        auto b = getLocalBounds();
+
+        // Overall background
+        g.setColour (juce::Colour (0xff1C1C1E));
+        g.fillRect (b);
+
+        // ── Ruler bar ────────────────────────────────────────────────────────
+        {
+            juce::Rectangle<int> ruler (b.getX(), b.getY(), b.getWidth(), kRulerH);
+            g.setColour (juce::Colour (0xff2C2C2E));
+            g.fillRect (ruler);
+            g.setColour (juce::Colour (0xff48484A));
+            g.drawHorizontalLine (ruler.getBottom(), 0.f, (float)b.getWidth());
+
+            // "TIMELINE" label in sidebar zone
+            g.setColour (juce::Colour (0xff8E8E93));
+            g.setFont (juce::Font (juce::FontOptions{}.withName("Menlo").withHeight(10.0f)));
+            g.drawText ("TIMELINE", ruler.getX() + 4, ruler.getY(),
+                        kSideW - 4, kRulerH, juce::Justification::centredLeft);
+
+            // Tick marks in curve zone
+            const int curveX = b.getX() + kSideW + 2;
+            float maxSec  = getMaxDurationSec();
+            float tickStep = getTickStep();
+            g.setColour (juce::Colour (0xff636366));
+            g.setFont (juce::Font (juce::FontOptions{}.withName("Menlo").withHeight(9.0f)));
+            for (float t = 0.f; t <= maxSec + tickStep * 0.5f; t += tickStep)
+            {
+                int tx = curveX + (int)(t * kDefaultPxPerSec);
+                if (tx > b.getRight()) break;
+                bool major = (std::fmod (t, tickStep * 2.f) < 0.01f) || tickStep >= 10.f;
+                g.setColour (major ? juce::Colour (0xff636366) : juce::Colour (0xff3A3A3C));
+                g.drawVerticalLine (tx, (float)ruler.getY() + (major ? 4 : 10), (float)ruler.getBottom());
+                if (major)
+                {
+                    g.setColour (juce::Colour (0xff8E8E93));
+                    g.drawText (formatTime (t), tx + 2, ruler.getY() + 3, 40, 14,
+                                juce::Justification::centredLeft);
+                }
+            }
+        }
+
+        // ── Per-lane overlays (drawn on top of lanesContent_ area) ────────────
+        // (Lane background is in lanesContent_.paint; we draw destination chips and
+        //  playheads here because they need to account for viewport scroll offset.)
+        if (proc_ == nullptr) return;
+
+        int scrollY = lanesViewport_.getViewPositionY();
+        const int curveX = b.getX() + kSideW + 2;
+        const int curveW = b.getWidth() - kSideW - 2;
+
+        for (int i = 0; i < 8; ++i)
+        {
+            auto& tl = proc_->getTimeline (i);
+            // Lane y in this component's coordinate space
+            int laneTopInContent = i * kLaneH;
+            int ly = b.getY() + kRulerH + laneTopInContent - scrollY;
+            if (ly + kLaneH < b.getY() + kRulerH) continue;   // scrolled above
+            if (ly >= b.getBottom()) break;                    // scrolled below
+
+            bool  active  = tl.isActive();
+            float phase   = tl.getCurrentPhase();
+            float dur     = tl.durationSec.load (std::memory_order_relaxed);
+
+            // Sidebar background per-lane (alt shading)
+            g.setColour (i % 2 == 0 ? juce::Colour (0xff242426) : juce::Colour (0xff222224));
+            g.fillRect (b.getX(), ly, kSideW, kLaneH - 1);
+
+            // Lane number
+            g.setColour (juce::Colour (active ? 0xffF2F2F7u : 0xff636366u));
+            g.setFont (juce::Font (juce::FontOptions{}.withName("Menlo").withHeight(10.0f)));
+            g.drawText ("TL" + juce::String(i + 1), b.getX() + 3, ly + 50, 40, 14,
+                        juce::Justification::centredLeft);
+
+            // Destination chips — bottom of sidebar
+            static const char* destNames[] = { "None","Pitch","Att","Dec","Sus","Rel",
+                                               "FltHz","FltQ","Drive","RvbMix","RvbSz","LoopMs" };
+            static const char* vCols[] = { "V1", "V2", "V3" };
+            const auto& dests = tl.getPendingDests();
+            int chipY = ly + kLaneH - 24;
+            int chipX = b.getX() + 3;
+            for (int d = 0; d < (int)dests.size() && d < 4; ++d)
+            {
+                int v  = dests[(size_t)d].voice;
+                int dt = dests[(size_t)d].dest;
+                juce::String label = (v >= 0 && v < 3 && dt >= 0 && dt < 12)
+                    ? (juce::String(vCols[v]) + " " + juce::String(destNames[dt]))
+                    : "?";
+                int chipW = juce::jmin (kSideW - 6, 108);
+                g.setColour (juce::Colour (0xff3A3A3C));
+                g.fillRoundedRectangle ((float)chipX, (float)chipY, (float)chipW, 14.f, 3.f);
+                // Voice colour accent bar
+                const uint32_t vcol[] = { 0xff0A84FF, 0xffFF9F0A, 0xffBF5AF2 };
+                if (v >= 0 && v < 3)
+                {
+                    g.setColour (juce::Colour (vcol[v]));
+                    g.fillRect (chipX, chipY, 3, 14);
+                }
+                g.setColour (juce::Colour (0xffF2F2F7));
+                g.setFont (juce::Font (juce::FontOptions{}.withName("Menlo").withHeight(9.0f)));
+                g.drawText (label, chipX + 5, chipY, chipW - 5, 14, juce::Justification::centredLeft);
+                chipX += chipW + 2;
+                if (chipX + 40 > b.getX() + kSideW) { chipY -= 16; chipX = b.getX() + 3; }
+            }
+
+            if (!active) continue;
+
+            // ── Playhead in curve area ────────────────────────────────────────
+            int playheadX = curveX + (int)(phase * (float)curveW);
+            g.setColour (juce::Colour (0xff30D158).withAlpha (0.07f));
+            g.fillRect (curveX, ly, (int)(phase * curveW), kLaneH - 1);
+            g.setColour (juce::Colour (0xffFFD60A).withAlpha (0.9f));
+            g.drawVerticalLine (playheadX, (float)ly, (float)(ly + kLaneH - 25));
+
+            // Duration indicator — right edge of full duration
+            g.setColour (juce::Colour (0xff636366));
+            g.drawVerticalLine (curveX + curveW - 1, (float)ly, (float)(ly + kLaneH - 1));
+
+            // Phase label
+            g.setColour (juce::Colour (0xff8E8E93));
+            g.setFont (juce::Font (juce::FontOptions{}.withName("Menlo").withHeight(8.5f)));
+            float elapsedSec = phase * dur;
+            g.drawText (formatTime(elapsedSec) + " / " + formatTime(dur),
+                        curveX + 4, ly + kLaneH - 24, 140, 14,
+                        juce::Justification::centredLeft);
+        }
+    }
+
+    //==========================================================================
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        // Double-click on a duration label area to edit duration
+        (void) e;
+    }
+
+private:
+    static constexpr int   kRulerH        = 28;
+    static constexpr int   kLaneH         = 120;
+    static constexpr int   kSideW         = 120;
+    static constexpr float kDefaultPxPerSec = 3.0f;
+
+    W2SamplerProcessor* proc_ = nullptr;
+
+    // Scrollable lane area
+    juce::Viewport  lanesViewport_;
+    LanesContent    lanesContent_;
+
+    // Zoom slider (in ruler row)
+    juce::Slider    zoomSlider_;
+
+    // Per-lane components (children of lanesContent_)
+    juce::TextButton activeBtn_[8];
+    juce::TextButton loopBtn_[8];
+    juce::TextButton addDestBtn_[8];
+    juce::TextButton clearDestBtn_[8];
+    juce::Label      durationLabel_[8];
+    FuncGenCanvas    fgCanvas_[8];
+
+    //==========================================================================
+    void buildLaneControls()
+    {
+        // Zoom slider
+        zoomSlider_.setSliderStyle (juce::Slider::LinearHorizontal);
+        zoomSlider_.setTextBoxStyle (juce::Slider::NoTextBox, true, 0, 0);
+        zoomSlider_.setRange (0.2, 8.0, 0.0);
+        zoomSlider_.setValue (1.0, juce::dontSendNotification);
+        zoomSlider_.setColour (juce::Slider::backgroundColourId, juce::Colour (0xff48484A));
+        zoomSlider_.setColour (juce::Slider::trackColourId,      juce::Colour (0xff30D158));
+        zoomSlider_.setColour (juce::Slider::thumbColourId,      juce::Colour (0xffF2F2F7));
+        zoomSlider_.setPopupDisplayEnabled (false, false, nullptr);
+        zoomSlider_.onValueChange = [this] { repaint(); };
+        addAndMakeVisible (zoomSlider_);
+
+        for (int i = 0; i < 8; ++i)
+        {
+            auto& tl = proc_->getTimeline (i);
+
+            // Active toggle — "ON" or "OFF"
+            bool act = tl.isActive();
+            activeBtn_[i].setButtonText (act ? "ON" : "OFF");
+            activeBtn_[i].setColour (juce::TextButton::buttonColourId,
+                juce::Colour (act ? 0xff30D158u : 0xff3A3A3Cu));
+            activeBtn_[i].setColour (juce::TextButton::textColourOffId, juce::Colour (0xffF2F2F7));
+            activeBtn_[i].onClick = [this, i] {
+                if (!proc_) return;
+                bool now = !proc_->getTimeline(i).isActive();
+                proc_->getTimeline(i).setActive (now);
+                activeBtn_[i].setButtonText (now ? "ON" : "OFF");
+                activeBtn_[i].setColour (juce::TextButton::buttonColourId,
+                    juce::Colour (now ? 0xff30D158u : 0xff3A3A3Cu));
+                repaint();
+            };
+            lanesContent_.addAndMakeVisible (activeBtn_[i]);
+
+            // Loop toggle
+            bool loop = tl.looping.load (std::memory_order_relaxed);
+            loopBtn_[i].setButtonText ("LOOP");
+            loopBtn_[i].setColour (juce::TextButton::buttonColourId,
+                juce::Colour (loop ? 0xff30D158u : 0xff3A3A3Cu));
+            loopBtn_[i].setColour (juce::TextButton::textColourOffId, juce::Colour (0xffF2F2F7));
+            loopBtn_[i].onClick = [this, i] {
+                if (!proc_) return;
+                bool now = !proc_->getTimeline(i).looping.load (std::memory_order_relaxed);
+                proc_->getTimeline(i).looping.store (now, std::memory_order_relaxed);
+                loopBtn_[i].setColour (juce::TextButton::buttonColourId,
+                    juce::Colour (now ? 0xff30D158u : 0xff3A3A3Cu));
+                repaint();
+            };
+            lanesContent_.addAndMakeVisible (loopBtn_[i]);
+
+            // Duration label — shows "60s", double-click to edit
+            float dur = tl.durationSec.load (std::memory_order_relaxed);
+            durationLabel_[i].setText (formatDurForEdit (dur), juce::dontSendNotification);
+            durationLabel_[i].setFont (juce::Font (juce::FontOptions{}.withName("Menlo").withHeight(11.0f)));
+            durationLabel_[i].setColour (juce::Label::textColourId,       juce::Colour (0xffF2F2F7));
+            durationLabel_[i].setColour (juce::Label::backgroundColourId, juce::Colour (0xff3A3A3C));
+            durationLabel_[i].setColour (juce::Label::textWhenEditingColourId, juce::Colour (0xffF2F2F7));
+            durationLabel_[i].setColour (juce::Label::backgroundWhenEditingColourId, juce::Colour (0xff1C1C1E));
+            durationLabel_[i].setJustificationType (juce::Justification::centred);
+            durationLabel_[i].setEditable (false, true, false); // double-click to edit
+            durationLabel_[i].onTextChange = [this, i] {
+                if (!proc_) return;
+                float sec = parseDuration (durationLabel_[i].getText());
+                if (sec > 0.f)
+                    proc_->getTimeline(i).durationSec.store (sec, std::memory_order_relaxed);
+            };
+            lanesContent_.addAndMakeVisible (durationLabel_[i]);
+
+            // + Dest button
+            addDestBtn_[i].setButtonText ("+ Dest");
+            addDestBtn_[i].setColour (juce::TextButton::buttonColourId, juce::Colour (0xff3A3A3Cu));
+            addDestBtn_[i].setColour (juce::TextButton::textColourOffId, juce::Colour (0xffF2F2F7));
+            addDestBtn_[i].onClick = [this, i] { showAddDestMenu (i); };
+            lanesContent_.addAndMakeVisible (addDestBtn_[i]);
+
+            // Clear dests button
+            clearDestBtn_[i].setButtonText ("Clear");
+            clearDestBtn_[i].setColour (juce::TextButton::buttonColourId, juce::Colour (0xff3A3A3Cu));
+            clearDestBtn_[i].setColour (juce::TextButton::textColourOffId, juce::Colour (0xffF2F2F7));
+            clearDestBtn_[i].onClick = [this, i] {
+                if (proc_) { proc_->getTimeline(i).clearDests(); repaint(); }
+            };
+            lanesContent_.addAndMakeVisible (clearDestBtn_[i]);
+
+            // FuncGenCanvas — linked to the timeline's curve
+            fgCanvas_[i].setFuncGen (&tl.curve);
+            fgCanvas_[i].onChange = [this] { repaint(); };
+            lanesContent_.addAndMakeVisible (fgCanvas_[i]);
+        }
+    }
+
+    float getMaxDurationSec() const
+    {
+        float mx = 30.f;
+        if (proc_)
+            for (int i = 0; i < 8; ++i)
+                mx = std::max (mx, proc_->getTimeline(i).durationSec.load (std::memory_order_relaxed));
+        return mx;
+    }
+
+    float getTickStep() const
+    {
+        const float steps[] = { 1.f, 2.f, 5.f, 10.f, 15.f, 30.f, 60.f, 120.f, 300.f };
+        for (float s : steps)
+            if (s * kDefaultPxPerSec >= 30.f) return s;
+        return 60.f;
+    }
+
+    static juce::String formatTime (float secs)
+    {
+        if (secs < 60.f) return juce::String ((int)secs) + "s";
+        int m = (int)(secs / 60.f);
+        int s = (int)std::fmod (secs, 60.f);
+        return juce::String(m) + "m" + (s > 0 ? juce::String(s) + "s" : "");
+    }
+
+    static juce::String formatDurForEdit (float secs)
+    {
+        // e.g. "60s" or "2m30s" — used in duration label
+        if (secs < 60.f) return juce::String ((int)secs) + "s";
+        int m = (int)(secs / 60.f);
+        int s = (int)std::fmod (secs, 60.f);
+        return juce::String(m) + "m" + juce::String(s) + "s";
+    }
+
+    // Parse "60s", "2m", "2m30s", "90" (bare number = seconds)
+    static float parseDuration (const juce::String& text)
+    {
+        juce::String t = text.trim().toLowerCase();
+        float total = 0.f;
+        // parse minutes
+        int mIdx = t.indexOfChar ('m');
+        if (mIdx >= 0)
+        {
+            total += t.substring (0, mIdx).getFloatValue() * 60.f;
+            t = t.substring (mIdx + 1);
+        }
+        // parse seconds
+        int sIdx = t.indexOfChar ('s');
+        if (sIdx >= 0) total += t.substring (0, sIdx).getFloatValue();
+        else if (t.isNotEmpty()) total += t.getFloatValue();
+        return total > 0.f ? total : -1.f;
+    }
+
+    void showAddDestMenu (int lane)
+    {
+        if (!proc_) return;
+        static const char* destNames[] = { "None","Pitch","Attack","Decay","Sustain","Release",
+                                           "Filter Hz","Filter Q","Drive","Reverb Mix","Reverb Size","Loop Ms" };
+        juce::PopupMenu menu;
+        for (int v = 0; v < 3; ++v)
+        {
+            juce::PopupMenu sub;
+            for (int d = 1; d < 12; ++d)
+                sub.addItem (v * 100 + d, juce::String(destNames[d]));
+            menu.addSubMenu ("Voice " + juce::String(v + 1), sub);
+        }
+        menu.showMenuAsync (juce::PopupMenu::Options{}, [this, lane] (int result) {
+            if (!proc_ || result <= 0) return;
+            int v = result / 100;
+            int d = result % 100;
+            if (v < 0 || v > 2 || d < 1 || d > 11) return;
+            TimelineDest td;
+            td.voice = v; td.dest = d;
+            td.depth = 1.0f; td.min = 0.0f; td.max = 1.0f;
+            proc_->getTimeline(lane).addDest (td);
+            repaint();
+        });
+    }
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TimelineView)
+};
+
+//==============================================================================
+/**
  * W2SamplerEditor — resizable (940×720 default), dark theme.
  *
  * Layout:
@@ -373,6 +810,11 @@ private:
     juce::Rectangle<int> masterColumnRect_;
     juce::Slider      masterGainSlider;
 
+    // Timeline view (toggles with center rings)
+    bool         showTimeline_ = false;
+    juce::TextButton tlToggleBtn { "TL" };
+    TimelineView timelineView_;
+
     //==========================================================================
     // Per-voice UI (all three built; only selectedVoice shown in left panel)
     struct VoiceUI
@@ -436,6 +878,8 @@ private:
         juce::Label      gainLabel     { "", "Level" };
         juce::Label      preGainLabel  { "", "Pre Gain" };
         juce::Label      limitLabel    { "", "Limit dB" };
+        juce::Slider     smoothSlider;
+        juce::Label      smoothLabel  { "", "Smooth ms" };
 
         // ── Modulation section (section 5, left panel) ───────────────────────
         static constexpr int kNumFg = 4;

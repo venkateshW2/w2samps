@@ -67,6 +67,9 @@ public:
         float    loopEnd     = 1.0f;   // normalised; ignored if loopSizeLock=true
         float    loopSizeMs  = 100.0f; // used when loopSizeLock=true
         bool     loopSizeLock = false; // if true, loopEnd = loopStart + loopSizeMs
+
+        // Anti-click parameter smoothing (0 = off)
+        float paramSmoothMs = 0.f;
     };
 
     //==========================================================================
@@ -104,6 +107,10 @@ public:
         playing_              = false;
         exhausted_            = false;
         triggerFadeRemaining_ = 0;
+
+        // Reset parameter smoothers to defaults
+        smFilterFreq_ = 20000.f; smFilterRes_ = 0.707f;
+        smDrive_ = 0.f; smPreGain_ = 1.f; smGain_ = 1.f;
     }
 
     /** Message thread: set or replace the source buffer. Full state reset. */
@@ -162,8 +169,6 @@ public:
             params.attackSec, params.decaySec,
             params.sustain,   params.releaseSec
         });
-        filter_.setCutoffFrequency (params.filterFreqHz);
-        filter_.setResonance (std::max (0.5f, params.filterRes));
 
         juce::Reverb::Parameters rp;
         rp.roomSize   = params.reverbSize;
@@ -173,6 +178,24 @@ public:
         rp.width      = 1.0f;
         rp.freezeMode = params.reverbFreeze ? 1.0f : 0.0f;
         reverb_.setParameters (rp);
+
+        // ── Block-rate parameter smoothing (reduces modulation clicks) ─────────
+        {
+            float smoothAlpha = 1.0f;
+            if (params.paramSmoothMs > 0.5f)
+            {
+                float smoothSamples = params.paramSmoothMs * 0.001f * (float) sampleRate_;
+                smoothAlpha = std::min (1.0f, (float) numSamples / smoothSamples);
+            }
+            smFilterFreq_ += smoothAlpha * (params.filterFreqHz - smFilterFreq_);
+            smFilterRes_  += smoothAlpha * (params.filterRes    - smFilterRes_);
+            smDrive_      += smoothAlpha * (params.distDrive    - smDrive_);
+            smPreGain_    += smoothAlpha * (params.preGain      - smPreGain_);
+            smGain_       += smoothAlpha * (params.gain         - smGain_);
+
+            filter_.setCutoffFrequency (smFilterFreq_);
+            filter_.setResonance (std::max (0.5f, smFilterRes_));
+        }
 
         // ── Resolve region + loop boundaries (samples) ───────────────────────
         int   srcLen   = (buffer_ != nullptr) ? buffer_->getNumSamples() : 0;
@@ -289,17 +312,17 @@ public:
         }
 
         // ── Pre-amp gain (before drive) ───────────────────────────────────────
-        if (std::abs (params.preGain - 1.0f) > 0.001f)
+        if (std::abs (smPreGain_ - 1.0f) > 0.001f)
         {
             for (int ch = 0; ch < dstChans; ++ch)
                 juce::FloatVectorOperations::multiply (
-                    tempBuf_.getWritePointer (ch), params.preGain, numSamples);
+                    tempBuf_.getWritePointer (ch), smPreGain_, numSamples);
         }
 
         // ── Distortion ────────────────────────────────────────────────────────
-        if (params.distDrive > 0.001f)
+        if (smDrive_ > 0.001f)
         {
-            float preGainDrv  = 1.0f + params.distDrive * 9.0f;
+            float preGainDrv  = 1.0f + smDrive_ * 9.0f;
             float postGainDrv = 1.0f / std::tanh (preGainDrv);
             for (int ch = 0; ch < dstChans; ++ch)
             {
@@ -310,7 +333,7 @@ public:
         }
 
         // ── Low-pass filter ───────────────────────────────────────────────────
-        if (params.filterFreqHz < 19900.0f)
+        if (smFilterFreq_ < 19900.0f)
         {
             juce::dsp::AudioBlock<float> block (
                 tempBuf_.getArrayOfWritePointers(),
@@ -339,8 +362,8 @@ public:
             limiter_.process (ctx);
         }
 
-        // ── Mix into output (params.gain = post-FX track level) ───────────────
-        float finalGain = params.gain * velocity_;
+        // ── Mix into output (smGain_ = smoothed post-FX track level) ─────────
+        float finalGain = smGain_ * velocity_;
         int   outChans  = output.getNumChannels();
         for (int ch = 0; ch < outChans; ++ch)
             output.addFrom (ch, startSample, tempBuf_, ch % dstChans, 0, numSamples, finalGain);
@@ -369,4 +392,11 @@ private:
     juce::Reverb                             reverb_;
     juce::dsp::Limiter<float>                limiter_;
     juce::AudioBuffer<float>                 tempBuf_;
+
+    // Block-rate parameter smoothers (anti-click for modulation)
+    float smFilterFreq_ = 20000.f;
+    float smFilterRes_  = 0.707f;
+    float smDrive_      = 0.f;
+    float smPreGain_    = 1.f;
+    float smGain_       = 1.f;
 };
