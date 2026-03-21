@@ -22,7 +22,9 @@
       "Bash(./build.sh)",
       "Bash(git push:*)",
       "Bash(git remote:*)",
-      "Bash(cmake --build /Users/justmac/w2app/w2-audio-plugs/build --parallel)"
+      "Bash(cmake --build /Users/justmac/w2app/w2-audio-plugs/build --parallel)",
+      "WebSearch",
+      "Read(//Users/justmac/Downloads/Submission/**)"
     ],
     "additionalDirectories": [
       "/Users/justmac/w2app/w2-audio-plugs",

@@ -1,4 +1,5 @@
 #pragma once
+#include "Playlist.h"
 #include "SampleLibrary.h"
 #include "GranularVoice.h"
 #include "EuclideanSequencer.h"
@@ -124,6 +125,13 @@ public:
     void loadSingleFile (const juce::File& file, juce::AudioFormatManager& fmgr)
     {
         library_.loadSingleFile (file, fmgr);
+        loadCurrentSampleIntoVoice();
+    }
+
+    void loadPlaylist (const Playlist& pl, juce::AudioFormatManager& fmt)
+    {
+        voice_.stop();
+        library_.loadFromPlaylist (pl, fmt);
         loadCurrentSampleIntoVoice();
     }
 

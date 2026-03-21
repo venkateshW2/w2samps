@@ -511,16 +511,15 @@ struct DragBar : juce::Component
 // ─────────────────────────────────────────────────────────────────────────────
 class SoundBrowserContent : public juce::Component,
                             public juce::ListBoxModel,
+                            public juce::ChangeListener,
                             private juce::Timer
 {
 public:
     explicit SoundBrowserContent (W2SamplerProcessor& p) : proc_ (p)
     {
         // Toolbar
-        for (auto* b : { &addFileBtn, &addFolderBtn, &analyseAllBtn, &rebuildBtn })
+        for (auto* b : { &analyseAllBtn, &rebuildBtn })
             addAndMakeVisible (b);
-        addFileBtn   .onClick = [this] { pickFiles(); };
-        addFolderBtn .onClick = [this] { pickFolder(); };
         analyseAllBtn.onClick = [this] { analyseAll(); };
         rebuildBtn   .onClick = [this] { triggerRebuildCorpus(); };
 
@@ -543,6 +542,21 @@ public:
         plRemoveBtn.setButtonText ("Remove");
         plRemoveBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff3A1A1A));
         plRemoveBtn.onClick = [this] { removeFromPlaylist(); };
+
+        // Filesystem browser setup
+        dirThread_.startThread();
+        currentDir_ = juce::File::getSpecialLocation (juce::File::userMusicDirectory);
+        dirContents_ = std::make_unique<juce::DirectoryContentsList> (&audioFilter_, dirThread_);
+        dirContents_->addChangeListener (this);
+        dirContents_->setDirectory (currentDir_, true, true);
+
+        addAndMakeVisible (upDirBtn_);
+        upDirBtn_.onClick = [this] { navigateUp(); };
+
+        addAndMakeVisible (pathLabel_);
+        pathLabel_.setFont (juce::Font (juce::FontOptions{}.withHeight (10.f)));
+        pathLabel_.setColour (juce::Label::textColourId, juce::Colour (0xff8E8E93));
+        pathLabel_.setText (currentDir_.getFullPathName(), juce::dontSendNotification);
 
         // File list — used for both Browse and Playlist mode (getNumRows/paint checks mode)
         addAndMakeVisible (fileList);
@@ -699,13 +713,19 @@ public:
         startTimerHz (20);
     }
 
-    ~SoundBrowserContent() override { stopTimer(); proc_.stopPreview(); }
+    ~SoundBrowserContent() override
+    {
+        stopTimer();
+        proc_.stopPreview();
+        if (dirContents_) dirContents_->removeChangeListener (this);
+        dirThread_.stopThread (2000);
+    }
 
     //──────────────────────────────────────────────────────────────────────────
     int getNumRows() override
     {
         if (leftMode_ == LeftMode::Playlist) return currentPlaylist_.size();
-        return SampleDatabase::instance().size();
+        return dirContents_ ? dirContents_->getNumFiles() : 0;
     }
 
     void paintListBoxItem (int row, juce::Graphics& g, int w, int h, bool sel) override
@@ -715,36 +735,64 @@ public:
             paintPlaylistRow (row, g, w, h, sel);
             return;
         }
+        paintBrowseRow (row, g, w, h, sel);
+    }
 
-        auto& entries = SampleDatabase::instance().getEntries();
-        if (row < 0 || row >= (int)entries.size()) return;
-        const auto& e = entries[(size_t)row];
+    void paintBrowseRow (int row, juce::Graphics& g, int w, int h, bool sel)
+    {
+        if (!dirContents_ || row >= dirContents_->getNumFiles()) return;
+        juce::DirectoryContentsList::FileInfo info;
+        if (!dirContents_->getFileInfo (row, info)) return;
 
         if (sel) g.fillAll (juce::Colour (0xff30D158).withAlpha (0.22f));
         else if (row % 2 == 0) g.fillAll (juce::Colour (0xff1E1E22));
 
-        if (e.valid) { int ci = (e.cluster >= 0 && e.cluster < 8) ? e.cluster : 7;
-                       g.setColour (juce::Colour (kClusterCols[ci])); }
-        else           g.setColour (juce::Colour (0xff555558));
-        g.fillRect (0, 2, 4, h - 4);
-
-        g.setFont (10.f);
-        if (!e.valid) { g.setColour (juce::Colour (0xff888888));
-                        g.drawText ("...", 8, 0, 18, h, juce::Justification::centredLeft); }
-
-        g.setColour (e.valid ? juce::Colour (0xffE0E0E5) : juce::Colour (0xff888888));
-        g.setFont (11.f);
-        int nameX = e.valid ? 10 : 26;
-        g.drawText (e.file.getFileNameWithoutExtension(), nameX, 0, w - 160, h,
-                    juce::Justification::centredLeft, true);
-
-        if (e.valid || e.metaBpm > 0.f || e.metaKey.isNotEmpty())
+        bool isDir = info.isDirectory;
+        if (isDir)
         {
-            juce::String key  = e.valid ? e.keyName : e.metaKey;
-            float        bpm  = e.valid ? e.tempo   : e.metaBpm;
-            juce::String meta = key + (bpm > 0.f ? "  " + juce::String (bpm, 0) + " bpm" : "");
-            g.setColour (juce::Colour (0xff6E6E73)); g.setFont (10.f);
-            g.drawText (meta, w - 158, 0, 154, h, juce::Justification::centredRight, true);
+            // Blue folder indicator
+            g.setColour (juce::Colour (0xff0A84FF));
+            g.fillRect (0, 2, 4, h - 4);
+            g.setColour (juce::Colour (0xff6E9FD4));
+            g.setFont (10.f);
+            g.drawText (juce::CharPointer_UTF8 ("\xe2\x96\xb6"), 7, 0, 12, h,
+                        juce::Justification::centred);
+            g.setColour (juce::Colour (0xffC0C0C8));
+            g.setFont (11.f);
+            g.drawText (info.filename, 22, 0, w - 24, h,
+                        juce::Justification::centredLeft, true);
+        }
+        else
+        {
+            juce::File f = currentDir_.getChildFile (info.filename);
+            const SampleEntry* dbEntry = SampleDatabase::instance().getEntry (f);
+
+            if (dbEntry && dbEntry->valid)
+            {
+                int ci = (dbEntry->cluster >= 0 && dbEntry->cluster < 8) ? dbEntry->cluster : 7;
+                g.setColour (juce::Colour (kClusterCols[ci]));
+            }
+            else if (dbEntry)
+                g.setColour (juce::Colour (0xffFFD60A).withAlpha (0.7f));
+            else
+                g.setColour (juce::Colour (0xff444448));
+            g.fillRect (0, 2, 4, h - 4);
+
+            g.setColour (juce::Colour (0xffE0E0E5));
+            g.setFont (11.f);
+            g.drawText (info.filename, 10, 0, w - 160, h,
+                        juce::Justification::centredLeft, true);
+
+            if (dbEntry && dbEntry->valid)
+            {
+                juce::String meta = dbEntry->keyName
+                    + (dbEntry->tempo > 0.f
+                       ? "  " + juce::String (dbEntry->tempo, 0) + " bpm" : "");
+                g.setColour (juce::Colour (0xff6E6E73));
+                g.setFont (10.f);
+                g.drawText (meta, w - 158, 0, 154, h,
+                            juce::Justification::centredRight, true);
+            }
         }
     }
 
@@ -784,6 +832,15 @@ public:
 
     // Use only selectedRowsChanged — listBoxItemClicked would fire twice per click
     void listBoxItemClicked  (int, const juce::MouseEvent&) override {}
+
+    void listBoxItemDoubleClicked (int row, const juce::MouseEvent&) override
+    {
+        if (leftMode_ != LeftMode::Browse || !dirContents_) return;
+        juce::DirectoryContentsList::FileInfo info;
+        if (!dirContents_->getFileInfo (row, info)) return;
+        if (info.isDirectory)
+            navigateTo (currentDir_.getChildFile (info.filename));
+    }
     void selectedRowsChanged (int lastRow) override
     {
         if (leftMode_ == LeftMode::Playlist)
@@ -817,7 +874,27 @@ public:
         }
         else
         {
-            selectFileRow (lastRow);
+            // Browse mode — select a file from dirContents_
+            if (!dirContents_ || lastRow >= dirContents_->getNumFiles()) return;
+            juce::DirectoryContentsList::FileInfo info;
+            if (!dirContents_->getFileInfo (lastRow, info)) return;
+            if (info.isDirectory) return;  // don't load waveform for folders
+
+            juce::File f = currentDir_.getChildFile (info.filename);
+            selectedFileIdx_ = -1;  // reset DB index
+
+            // Check if in SampleDatabase
+            const SampleEntry* dbEntry = SampleDatabase::instance().getEntry (f);
+            if (dbEntry)
+            {
+                auto& entries = SampleDatabase::instance().getEntries();
+                for (int i = 0; i < (int)entries.size(); ++i)
+                    if (entries[(size_t)i].file == f) { selectedFileIdx_ = i; break; }
+            }
+
+            proc_.stopPreview();
+            refreshWaveformForFile (f);
+            refreshAnalysisPanelForFile (f);
         }
     }
 
@@ -832,11 +909,9 @@ public:
 
         // Toolbar
         auto top = b.removeFromTop (toolH);
-        statusLabel .setBounds (top.removeFromRight (200).reduced (4, 8));
-        addFileBtn  .setBounds (top.removeFromLeft (54).reduced (2, 5));
-        addFolderBtn.setBounds (top.removeFromLeft (62).reduced (2, 5));
-        analyseAllBtn.setBounds(top.removeFromLeft (80).reduced (2, 5));
-        rebuildBtn  .setBounds (top.removeFromLeft (108).reduced (2, 5));
+        statusLabel   .setBounds (top.removeFromRight (200).reduced (4, 8));
+        analyseAllBtn .setBounds (top.removeFromLeft (80).reduced (2, 5));
+        rebuildBtn    .setBounds (top.removeFromLeft (108).reduced (2, 5));
 
         // Corpus at bottom
         corpusView.setBounds (b.removeFromBottom (corpusH_));
@@ -848,8 +923,12 @@ public:
         auto tabRow = leftPanel.removeFromTop (26);
         browseTabBtn  .setBounds (tabRow.removeFromLeft (58).reduced (1, 2));
         playlistTabBtn.setBounds (tabRow.removeFromLeft (62).reduced (1, 2));
+        upDirBtn_     .setBounds (tabRow.removeFromLeft (24).reduced (1, 2));
+        upDirBtn_     .setVisible (leftMode_ == LeftMode::Browse);
         plRemoveBtn   .setBounds (tabRow.removeFromRight (58).reduced (1, 2));
-        plCombo       .setBounds (tabRow.reduced (2, 3));
+        plCombo       .setBounds (tabRow.removeFromRight (130).reduced (2, 3));
+        pathLabel_    .setBounds (tabRow.reduced (2, 4));
+        pathLabel_    .setVisible (leftMode_ == LeftMode::Browse);
         fileList      .setBounds (leftPanel);
 
         // Analysis panel right
@@ -887,11 +966,18 @@ private:
     int      selectedPlaylistRow_ = -1;
 
     // Toolbar
-    juce::TextButton addFileBtn   { "+File" };
-    juce::TextButton addFolderBtn { "+Folder" };
     juce::TextButton analyseAllBtn{ "Analyse All" };
     juce::TextButton rebuildBtn   { "Rebuild Corpus" };
     juce::Label      statusLabel;
+
+    // Filesystem browser (Browse mode)
+    juce::WildcardFileFilter                       audioFilter_  { "*.wav;*.aif;*.aiff;*.flac;*.mp3;*.ogg",
+                                                                    "*", "Audio files" };
+    juce::TimeSliceThread                          dirThread_    { "W2DirScan" };
+    std::unique_ptr<juce::DirectoryContentsList>   dirContents_;
+    juce::File                                     currentDir_;
+    juce::TextButton                               upDirBtn_     { juce::CharPointer_UTF8 ("\xe2\x86\x91") };
+    juce::Label                                    pathLabel_;
 
     // Left-panel tab row
     juce::TextButton browseTabBtn, playlistTabBtn, plRemoveBtn;
@@ -1029,7 +1115,6 @@ private:
 
     std::shared_ptr<juce::AudioBuffer<float>> previewBufPtr_;   // shared with processor — zero-copy
     double                             previewSampleRate_ = 44100.0;
-    std::unique_ptr<juce::FileChooser> fileChooser_;
     AnalysisWorker                     worker_;
 
     int  selectedFileIdx_    = -1;
@@ -1282,6 +1367,8 @@ private:
         fileList.updateContent();
         fileList.deselectAllRows();
         fileList.repaint();
+        upDirBtn_.setVisible (m == LeftMode::Browse);
+        pathLabel_.setVisible (m == LeftMode::Browse);
     }
 
     void updateTabAppearance()
@@ -1400,62 +1487,6 @@ private:
         }
     }
 
-    void pickFiles()
-    {
-        fileChooser_ = std::make_unique<juce::FileChooser> (
-            "Add audio files", juce::File{}, "*.wav;*.aif;*.aiff;*.flac;*.mp3");
-        fileChooser_->launchAsync (
-            juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles
-            | juce::FileBrowserComponent::canSelectMultipleItems,
-            [this] (const juce::FileChooser& fc)
-            {
-                for (const auto& f : fc.getResults())
-                {
-                    SampleDatabase::instance().addFileToList (f);
-                    worker_.addCheckCacheJob (f);  // restore prior analysis from JSON cache
-                }
-                fileList.updateContent();
-                fileList.repaint();
-                // Auto-select first if nothing selected
-                if (selectedFileIdx_ < 0 && SampleDatabase::instance().size() > 0)
-                {
-                    selectedFileIdx_ = 0;
-                    fileList.selectRow (0, false, true);
-                    refreshWaveform(); refreshAnalysisPanel();
-                }
-            });
-    }
-
-    void pickFolder()
-    {
-        fileChooser_ = std::make_unique<juce::FileChooser> ("Add folder", juce::File{});
-        fileChooser_->launchAsync (
-            juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
-            [this] (const juce::FileChooser& fc)
-            {
-                auto results = fc.getResults();
-                if (results.isEmpty()) return;
-                juce::Array<juce::File> files;
-                for (const auto& ext : { "wav","aif","aiff","flac","mp3" })
-                    results[0].findChildFiles (files, juce::File::findFiles, false,
-                                               juce::String ("*.") + ext);
-                files.sort();
-                for (const auto& f : files)
-                {
-                    SampleDatabase::instance().addFileToList (f);
-                    worker_.addCheckCacheJob (f);  // restore prior analysis from JSON cache
-                }
-                // No auto analysis or corpus rebuild — user clicks Analyse / Rebuild manually
-                fileList.updateContent(); fileList.repaint();
-                if (selectedFileIdx_ < 0 && SampleDatabase::instance().size() > 0)
-                {
-                    selectedFileIdx_ = 0;
-                    fileList.selectRow (0, false, true);
-                    refreshWaveform(); refreshAnalysisPanel();
-                }
-            });
-    }
-
     void sendToVoice (int v)
     {
         if (leftMode_ == LeftMode::Playlist)
@@ -1465,25 +1496,70 @@ private:
                 proc_.loadSingleFileWithAnalysis (v, e.file, e.analysis);
             return;
         }
-        auto& entries = SampleDatabase::instance().getEntries();
-        if (selectedFileIdx_ < 0 || selectedFileIdx_ >= (int)entries.size()) return;
-        const auto& e = entries[(size_t)selectedFileIdx_];
-        if (e.valid)
-            proc_.loadSingleFileWithAnalysis (v, e.file, e.analysis);
-        else
-            proc_.loadSingleFile (v, e.file);
+
+        // Browse mode — get file from dirContents_ if we have a dir selection
+        // first try selectedFileIdx_ (if file was also added to DB)
+        if (selectedFileIdx_ >= 0)
+        {
+            auto& entries = SampleDatabase::instance().getEntries();
+            if (selectedFileIdx_ < (int)entries.size())
+            {
+                const auto& e = entries[(size_t)selectedFileIdx_];
+                if (e.valid)
+                    proc_.loadSingleFileWithAnalysis (v, e.file, e.analysis);
+                else
+                    proc_.loadSingleFile (v, e.file);
+                return;
+            }
+        }
+
+        // File not in DB — load from currently selected dirContents_ row
+        if (dirContents_)
+        {
+            int row = fileList.getSelectedRow();
+            if (row >= 0 && row < dirContents_->getNumFiles())
+            {
+                juce::DirectoryContentsList::FileInfo info;
+                if (dirContents_->getFileInfo (row, info) && !info.isDirectory)
+                {
+                    juce::File f = currentDir_.getChildFile (info.filename);
+                    proc_.loadSingleFile (v, f);
+                }
+            }
+        }
     }
 
     //──────────────────────────────────────────────────────────────────────────
-    // Analyse All — queues AnalyseFile for every unanalysed entry
+    // Analyse All — queues AnalyseFile for every audio file in current dir (Browse)
+    // or every unanalysed entry (Playlist)
     //──────────────────────────────────────────────────────────────────────────
     void analyseAll()
     {
-        float sens = (float)sensSlider.getValue();
-        const auto& entries = SampleDatabase::instance().getEntries();
-        for (const auto& e : entries)
-            if (!e.valid)
-                worker_.addFileJob (e.file, sens);
+        if (leftMode_ == LeftMode::Browse && dirContents_)
+        {
+            float sens = (float)sensSlider.getValue();
+            for (int i = 0; i < dirContents_->getNumFiles(); ++i)
+            {
+                juce::DirectoryContentsList::FileInfo info;
+                if (dirContents_->getFileInfo (i, info) && !info.isDirectory)
+                {
+                    juce::File f = currentDir_.getChildFile (info.filename);
+                    SampleDatabase::instance().addFileToList (f);
+                    worker_.addCheckCacheJob (f);
+                    worker_.addFileJob (f, sens);
+                }
+            }
+            fileList.updateContent();
+            fileList.repaint();
+        }
+        else
+        {
+            float sens = (float)sensSlider.getValue();
+            const auto& entries = SampleDatabase::instance().getEntries();
+            for (const auto& e : entries)
+                if (!e.valid)
+                    worker_.addFileJob (e.file, sens);
+        }
     }
 
     //──────────────────────────────────────────────────────────────────────────
@@ -1583,6 +1659,77 @@ private:
             fileList.updateContent();
             fileList.repaint();
         }
+    }
+
+    //──────────────────────────────────────────────────────────────────────────
+    // Filesystem navigation
+    //──────────────────────────────────────────────────────────────────────────
+    void navigateTo (const juce::File& dir)
+    {
+        if (!dir.isDirectory()) return;
+        currentDir_ = dir;
+        pathLabel_.setText (currentDir_.getFullPathName(), juce::dontSendNotification);
+        dirContents_->setDirectory (currentDir_, true, true);
+        selectedFileIdx_ = -1;
+        fileList.updateContent();
+        fileList.repaint();
+    }
+
+    void navigateUp()
+    {
+        juce::File parent = currentDir_.getParentDirectory();
+        if (parent != currentDir_) navigateTo (parent);
+    }
+
+    void changeListenerCallback (juce::ChangeBroadcaster*) override
+    {
+        if (leftMode_ == LeftMode::Browse)
+        {
+            fileList.updateContent();
+            fileList.repaint();
+        }
+    }
+
+    //──────────────────────────────────────────────────────────────────────────
+    // Waveform/analysis refresh by File (for Browse mode, not relying on DB index)
+    //──────────────────────────────────────────────────────────────────────────
+    void refreshWaveformForFile (const juce::File& f)
+    {
+        int gen = ++waveLoadGeneration_;
+        waveLoading_ = true;
+        previewBufPtr_ = nullptr;
+        previewSampleRate_ = 44100.0;
+        waveComp.clear();
+        waveComp.setLoading (true);
+        worker_.addWaveformJob (f, [this, gen, f]
+            (std::shared_ptr<juce::AudioBuffer<float>>, double sr, WaveThumb thumb)
+        {
+            if (gen != waveLoadGeneration_) return;
+            waveLoading_ = false;
+            waveComp.setLoading (false);
+            previewSampleRate_ = sr;
+            const SampleEntry* e = SampleDatabase::instance().getEntry (f);
+            std::vector<float> onsets;
+            if (e && e->valid) onsets = e->analysis.onsetPositions;
+            waveComp.setBuffer (std::move (thumb), std::move (onsets));
+            waveComp.setSliceRegion (-1.f, -1.f);
+        });
+    }
+
+    void refreshAnalysisPanelForFile (const juce::File& f)
+    {
+        const SampleEntry* e = SampleDatabase::instance().getEntry (f);
+        if (!e)
+        {
+            for (auto* l : { &keyDetLabel, &keyMetaLabel, &bpmLabel, &onsetLabel, &pitchLabel })
+                l->setText ("", juce::dontSendNotification);
+            return;
+        }
+        // Sync selectedFileIdx_ so refreshAnalysisPanel works
+        auto& entries = SampleDatabase::instance().getEntries();
+        for (int i = 0; i < (int)entries.size(); ++i)
+            if (entries[(size_t)i].file == f) { selectedFileIdx_ = i; break; }
+        refreshAnalysisPanel();
     }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SoundBrowserContent)

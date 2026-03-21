@@ -434,6 +434,17 @@ void W2SamplerProcessor::loadSingleFileWithAnalysis (int v, const juce::File& fi
     *p.loopStart   = 0.0f;  *p.loopEnd   = 0.25f;
 }
 
+void W2SamplerProcessor::loadPlaylist (int v, const juce::String& playlistName)
+{
+    if (v < 0 || v > 2) return;
+    Playlist pl;
+    if (!Playlist::load (playlistName, pl)) return;
+    voices_[v].loadPlaylist (pl, formatManager_);
+    auto& p = vp[v];
+    *p.regionStart = 0.0f;  *p.regionEnd = 1.0f;
+    *p.loopStart   = 0.0f;  *p.loopEnd   = 0.25f;
+}
+
 void W2SamplerProcessor::prevSample   (int v) { if (v>=0&&v<3) voices_[v].prevSample(); }
 void W2SamplerProcessor::nextSample   (int v) { if (v>=0&&v<3) voices_[v].nextSample(); }
 void W2SamplerProcessor::randomSample (int v) { if (v>=0&&v<3) voices_[v].randomSample(); }

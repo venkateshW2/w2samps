@@ -1,4 +1,5 @@
 #include "PluginEditor.h"
+#include "Playlist.h"
 
 //==============================================================================
 // Style helpers
@@ -265,6 +266,18 @@ void W2SamplerEditor::buildVoiceUI (int v)
     leftContent_.addAndMakeVisible (ui.loadBtn);  leftContent_.addAndMakeVisible (ui.prevBtn);
     leftContent_.addAndMakeVisible (ui.nextBtn);  leftContent_.addAndMakeVisible (ui.rndBtn);
     leftContent_.addAndMakeVisible (ui.nameLabel);
+
+    // Playlist row
+    ui.playlistCombo.setTextWhenNothingSelected ("— no playlist —");
+    ui.playlistCombo.setTextWhenNoChoicesAvailable ("(no playlists saved)");
+    refreshPlaylistCombo (ui.playlistCombo);
+    styleButton (ui.loadPlaylistBtn);
+    ui.loadPlaylistBtn.onClick = [this, v] {
+        juce::String name = voiceUI[v].playlistCombo.getText();
+        if (name.isNotEmpty()) proc.loadPlaylist (v, name);
+    };
+    leftContent_.addAndMakeVisible (ui.playlistCombo);
+    leftContent_.addAndMakeVisible (ui.loadPlaylistBtn);
 
     // Onset sensitivity
     styleSlider (ui.onsetSensSlider, 0.0f, 1.0f, 0.5f);
@@ -820,6 +833,7 @@ void W2SamplerEditor::hideVoiceAll()
 
         hide (ui.loadBtn);   hide (ui.prevBtn);  hide (ui.nextBtn);
         hide (ui.rndBtn);    hide (ui.nameLabel); hide (ui.waveform);
+        hide (ui.playlistCombo); hide (ui.loadPlaylistBtn);
         hide (ui.onsetSensSlider); hide (ui.onsetSensLabel);
 
         hide (ui.stepsSlider);  hide (ui.stepsLabel);
@@ -925,6 +939,14 @@ void W2SamplerEditor::layoutVoicePanel (int v)
         {
             ui.nameLabel.setBounds (x0, y, panW, 18); ui.nameLabel.setVisible (true);
             y += 18 + rowGap;
+        }
+        // Playlist row: [combo fills width] [Load PL]
+        {
+            const int h = 24, btnW = 62;
+            refreshPlaylistCombo (ui.playlistCombo);
+            ui.playlistCombo   .setBounds (x0,               y, panW - btnW - 2, h); ui.playlistCombo   .setVisible (true);
+            ui.loadPlaylistBtn .setBounds (x0 + panW - btnW, y, btnW,            h); ui.loadPlaylistBtn .setVisible (true);
+            y += h + rowGap;
         }
         // Onset sens + RAW/STCH toggle on same row
         {
@@ -1544,6 +1566,15 @@ void W2SamplerEditor::timerCallback()
         if (proc.takeRandomizeFXRequest (v))
             proc.randomizeVoiceParams (v, voiceUI[v].rndLocked);
 
+    // Refresh playlist combos every ~2s (playlist list can change while browser is open)
+    static int plRefreshCounter = 0;
+    if (++plRefreshCounter >= 40)   // 20Hz timer → every 2 seconds
+    {
+        plRefreshCounter = 0;
+        for (int v = 0; v < 3; ++v)
+            refreshPlaylistCombo (voiceUI[v].playlistCombo);
+    }
+
     proc.decayOutputPeaks();
 
     if (proc.masterGain)
@@ -1807,4 +1838,19 @@ void W2SamplerEditor::updateCycleBtns (int v)
     // SmpAdv: any mode other than Hold (0) → active color
     ui.smpAdvBtn.setColour (juce::TextButton::buttonColourId,
         juce::Colour (p.sampleAdv->get() != 0 ? (uint32_t)kActive : (uint32_t)kElevated));
+}
+
+//==============================================================================
+void W2SamplerEditor::refreshPlaylistCombo (juce::ComboBox& cb)
+{
+    juce::String current = cb.getText();
+    cb.clear (juce::dontSendNotification);
+    juce::StringArray names = Playlist::listSaved();
+    int id = 1;
+    for (const auto& n : names) cb.addItem (n, id++);
+    if (current.isNotEmpty())
+    {
+        int idx = names.indexOf (current);
+        if (idx >= 0) cb.setSelectedItemIndex (idx, juce::dontSendNotification);
+    }
 }

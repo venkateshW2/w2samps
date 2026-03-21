@@ -4,6 +4,7 @@
 #include "FluCoMaAnalyser.h"  // for FluCoMaResult field in Entry (populated by SoundBrowser path only)
 #include "OnsetDetector.h"
 #include "KeyDetector.h"
+#include "Playlist.h"
 
 /**
  * SampleLibrary — manages a folder of one-shot audio files.
@@ -148,6 +149,67 @@ public:
 
         entries_.push_back (std::move (e));
         return 1;
+    }
+
+    /** Load all files from a Playlist into the library.
+     *  Injects pre-computed FluCoMa analysis (onsets, key, BPM) from each playlist entry.
+     *  Same memory model as loadFolder — all files decoded into memory.
+     *  Returns number of samples loaded. */
+    int loadFromPlaylist (const Playlist& pl, juce::AudioFormatManager& formatMgr)
+    {
+        entries_.clear();
+        currentIndex.store (0);
+
+        int loaded = 0;
+        for (int i = 0; i < pl.size() && loaded < kMaxSamples; ++i)
+        {
+            SampleEntry se;
+            if (!pl.getEntry (i, se)) continue;
+            if (!se.file.existsAsFile()) continue;
+
+            std::unique_ptr<juce::AudioFormatReader> reader (
+                formatMgr.createReaderFor (se.file));
+            if (!reader) continue;
+
+            auto e = std::make_unique<Entry>();
+            e->sampleRate = reader->sampleRate;
+            e->name       = se.file.getFileNameWithoutExtension();
+            e->file       = se.file;
+            e->buffer.setSize ((int)reader->numChannels, (int)reader->lengthInSamples);
+            reader->read (&e->buffer, 0, (int)reader->lengthInSamples, 0, true, true);
+
+            // Level analysis
+            {
+                double sumSq = 0.0;
+                float  peak  = 0.0f;
+                int    ns    = e->buffer.getNumSamples();
+                int    nc    = e->buffer.getNumChannels();
+                for (int s = 0; s < ns; ++s)
+                    for (int c = 0; c < nc; ++c)
+                    {
+                        float v = e->buffer.getSample (c, s);
+                        peak = std::max (peak, std::abs (v));
+                        sumSq += (double)(v * v);
+                    }
+                e->peakDb = peak > 0.f ? 20.f * std::log10 (peak) : -96.f;
+                float rms = (ns > 0 && nc > 0) ? (float)std::sqrt (sumSq / (double)(ns * nc)) : 0.f;
+                e->rmsDb  = rms > 0.f ? 20.f * std::log10 (rms) : -96.f;
+            }
+
+            // Inject pre-computed FluCoMa analysis from playlist
+            e->analysis                   = se.analysis;
+            e->onsetsAnalysed             = true;
+            e->onsets.positions           = se.analysis.onsetPositions;
+            e->onsets.count               = (int)se.analysis.onsetPositions.size();
+            e->onsets.estimatedBPM        = se.analysis.estimatedBpm;
+            e->detectedKey.keyName        = se.analysis.keyName;
+            e->detectedKey.confidence     = se.analysis.keyConfidence;
+            e->keyAnalysed                = true;
+
+            entries_.push_back (std::move (e));
+            ++loaded;
+        }
+        return loaded;
     }
 
     /**

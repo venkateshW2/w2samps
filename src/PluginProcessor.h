@@ -144,6 +144,8 @@ public:
     /** Load file and inject pre-computed FluCoMa analysis (onset positions, key, BPM etc.)
      *  from SoundBrowser. Skips redundant re-analysis. Message thread only. */
     void loadSingleFileWithAnalysis (int v, const juce::File& file, const FluCoMaResult& analysis);
+    /** Load a saved playlist into voice v. Decodes all files; injects FluCoMa analysis. */
+    void loadPlaylist (int v, const juce::String& playlistName);
     void prevSample      (int v);
     void nextSample      (int v);
     void randomSample    (int v);

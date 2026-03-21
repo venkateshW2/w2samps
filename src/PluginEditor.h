@@ -1291,6 +1291,10 @@ private:
         juce::TextButton rndBtn   { "Rnd" };
         juce::Label      nameLabel;
 
+        // Playlist row
+        juce::ComboBox   playlistCombo;
+        juce::TextButton loadPlaylistBtn { "Load PL" };
+
         // Onset sensitivity
         juce::Slider     onsetSensSlider;
         juce::Label      onsetSensLabel { "", "Sens" };
@@ -1395,6 +1399,7 @@ private:
     //==========================================================================
     void buildTransportBar();
     void buildVoiceUI   (int v);
+    static void refreshPlaylistCombo (juce::ComboBox& cb);
     void layoutTransportBar();
     void layoutMasterColumn();
     void layoutVoicePanel   (int v);
