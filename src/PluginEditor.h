@@ -5,6 +5,7 @@
 #include "WaveformDisplay.h"
 #include "FuncGen.h"
 #include "SoundBrowser.h"
+#include "OnsetHitMapper.h"
 
 //==============================================================================
 // FuncGenCanvas — drawable Catmull-Rom curve editor for one FuncGen.
@@ -1192,6 +1193,144 @@ private:
  *     x=W-120..W    Right column — master meter + gain fader
  *   y=H-90..H       Bottom bar — FX/Presets for selected voice
  */
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OnsetMapGrid — per-hit onset index table (Phase 2.F)
+//
+// Columns = euclidean hits (up to 16).
+// Rows    = "Auto" + up to 15 onset indices.
+// Click a cell to assign that onset to that hit slot; click the current
+// assignment to clear it back to Auto (-1).
+// ─────────────────────────────────────────────────────────────────────────────
+class OnsetMapGrid : public juce::Component
+{
+public:
+    void setup (W2SamplerProcessor& p, int v) { proc_ = &p; voice_ = v; }
+
+    /** Call from timer to update nOnsets_ and nHits_ and repaint if changed. */
+    void refresh()
+    {
+        if (!proc_) return;
+        const auto& lib = proc_->getVoice (voice_).getLibrary();
+        auto* e = lib.current();
+        int nO = (e && e->onsetsAnalysed) ? (int) e->onsets.positions.size() : 0;
+        int nH = proc_->vp[voice_].seqHits->get();
+        if (nO != nOnsets_ || nH != nHits_) { nOnsets_ = nO; nHits_ = nH; repaint(); }
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        auto b = getLocalBounds();
+        g.fillAll (juce::Colour (0xff1A1A1E));
+        g.setColour (juce::Colour (0xff2A2A2E)); g.drawRect (b, 1);
+        b = b.reduced (1);
+
+        int cols = juce::jlimit (1, 16, nHits_);
+        if (!proc_ || nHits_ <= 0)
+        {
+            g.setColour (juce::Colour (0xff555558)); g.setFont (10.f);
+            g.drawText ("Onset Map (set Hits > 0)", b, juce::Justification::centred);
+            return;
+        }
+
+        auto& mapper = proc_->getVoice (voice_).getOnsetHitMapper();
+        int dispOnsets = std::min (nOnsets_, 15);
+        int rows = 1 + dispOnsets;   // "Auto" row + onset rows
+
+        float cw = (float) b.getWidth()  / (float) cols;
+        float rh = (float) b.getHeight() / (float) rows;
+
+        g.setFont (9.f);
+
+        for (int r = 0; r < rows; ++r)
+        {
+            float ry = (float) b.getY() + rh * (float) r;
+            if (r == 0)
+            {
+                g.setColour (juce::Colour (0xff2E2E32));
+                g.fillRect (b.getX(), (int) ry, b.getWidth(), (int) rh);
+                g.setColour (juce::Colour (0xff8E8E93));
+                g.drawText ("Auto", b.getX() + 2, (int) ry, 30, (int) rh,
+                            juce::Justification::centredLeft);
+            }
+            else
+            {
+                if (r % 2 == 0)
+                {
+                    g.setColour (juce::Colour (0xff1E1E22));
+                    g.fillRect (b.getX(), (int) ry, b.getWidth(), (int) rh);
+                }
+                g.setColour (juce::Colour (0xff555558));
+                g.drawText (juce::String (r - 1), b.getX() + 2, (int) ry, 20, (int) rh,
+                            juce::Justification::centredLeft);
+            }
+            g.setColour (juce::Colour (0xff2A2A2E));
+            g.drawHorizontalLine ((int) ry, (float) b.getX(), (float) b.getRight());
+        }
+
+        for (int c = 0; c < cols; ++c)
+        {
+            float cx = (float) b.getX() + cw * (float) c;
+            g.setColour (juce::Colour (0xff2A2A2E));
+            g.drawVerticalLine ((int) cx, (float) b.getY(), (float) b.getBottom());
+
+            int8_t assigned = mapper.peek (c);
+            float  dotX = cx + cw * 0.5f;
+            float  dotR = std::min (cw, rh) * 0.3f;
+
+            if (assigned < 0)
+            {
+                // Auto — green dot in Auto row
+                float dotY = (float) b.getY() + rh * 0.5f;
+                g.setColour (juce::Colour (0xff30D158));
+                g.fillEllipse (dotX - dotR, dotY - dotR, dotR * 2.f, dotR * 2.f);
+            }
+            else if (assigned < dispOnsets)
+            {
+                // Specific onset — blue dot in onset row
+                float dotY = (float) b.getY() + rh * ((float) (assigned + 1) + 0.5f);
+                g.setColour (juce::Colour (0xff0A84FF));
+                g.fillEllipse (dotX - dotR, dotY - dotR, dotR * 2.f, dotR * 2.f);
+            }
+        }
+    }
+
+    void mouseDown (const juce::MouseEvent& ev) override
+    {
+        if (!proc_ || nHits_ <= 0) return;
+        auto b  = getLocalBounds().reduced (1);
+        int cols = juce::jlimit (1, 16, nHits_);
+        int dispOnsets = std::min (nOnsets_, 15);
+        int rows = 1 + dispOnsets;
+        float cw = (float) b.getWidth()  / (float) cols;
+        float rh = (float) b.getHeight() / (float) rows;
+
+        int col = (int) ((ev.x - b.getX()) / cw);
+        int row = (int) ((ev.y - b.getY()) / rh);
+        if (col < 0 || col >= cols) return;
+
+        auto& mapper = proc_->getVoice (voice_).getOnsetHitMapper();
+        if (row == 0)
+        {
+            mapper.set (col, -1);
+        }
+        else
+        {
+            int onsetIdx = row - 1;
+            if (onsetIdx >= dispOnsets) return;
+            int8_t cur = mapper.peek (col);
+            mapper.set (col, cur == (int8_t) onsetIdx ? (int8_t) -1 : (int8_t) onsetIdx);
+        }
+        repaint();
+    }
+
+private:
+    W2SamplerProcessor* proc_    = nullptr;
+    int                 voice_   = 0;
+    int                 nOnsets_ = 0;
+    int                 nHits_   = 0;
+};
+
 class W2SamplerEditor : public juce::AudioProcessorEditor,
                         public juce::Timer
 {
@@ -1301,6 +1440,9 @@ private:
 
         // Waveform
         WaveformDisplay  waveform;
+
+        // Onset hit map grid (SEQUENCE section — Phase 2.F)
+        OnsetMapGrid     onsetMapGrid;
 
         // Sequence section
         juce::Slider     stepsSlider, hitsSlider, rotSlider;

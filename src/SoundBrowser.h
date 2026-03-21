@@ -512,6 +512,7 @@ struct DragBar : juce::Component
 class SoundBrowserContent : public juce::Component,
                             public juce::ListBoxModel,
                             public juce::ChangeListener,
+                            public juce::FileDragAndDropTarget,
                             private juce::Timer
 {
 public:
@@ -557,6 +558,29 @@ public:
         pathLabel_.setFont (juce::Font (juce::FontOptions{}.withHeight (10.f)));
         pathLabel_.setColour (juce::Label::textColourId, juce::Colour (0xff8E8E93));
         pathLabel_.setText (currentDir_.getFullPathName(), juce::dontSendNotification);
+
+        // Quick-location buttons: Home / Music / Desktop / Volumes
+        for (auto* b : { &locHomeBtn_, &locMusicBtn_, &locDeskBtn_, &locVolBtn_ })
+            addAndMakeVisible (b);
+        locHomeBtn_ .setButtonText ("~");
+        locMusicBtn_.setButtonText ("Music");
+        locDeskBtn_ .setButtonText ("Desktop");
+        locVolBtn_  .setButtonText ("Volumes");
+        locHomeBtn_ .onClick = [this] { navigateTo (juce::File::getSpecialLocation (juce::File::userHomeDirectory)); };
+        locMusicBtn_.onClick = [this] { navigateTo (juce::File::getSpecialLocation (juce::File::userMusicDirectory)); };
+        locDeskBtn_ .onClick = [this] { navigateTo (juce::File::getSpecialLocation (juce::File::userDesktopDirectory)); };
+        locVolBtn_  .onClick = [this]
+        {
+            juce::File vols ("/Volumes");
+            juce::PopupMenu m;
+            if (vols.isDirectory())
+            {
+                for (auto& f : vols.findChildFiles (juce::File::findDirectories, false))
+                    m.addItem (f.getFileName(), [this, f] { navigateTo (f); });
+            }
+            if (m.getNumItems() == 0) m.addItem ("(no volumes found)", [] {});
+            m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&locVolBtn_));
+        };
 
         // File list — used for both Browse and Playlist mode (getNumRows/paint checks mode)
         addAndMakeVisible (fileList);
@@ -899,6 +923,23 @@ public:
     }
 
     //──────────────────────────────────────────────────────────────────────────
+    // FileDragAndDropTarget — drag a folder onto the browser to navigate there
+    //──────────────────────────────────────────────────────────────────────────
+    bool isInterestedInFileDrag (const juce::StringArray&) override
+    {
+        return leftMode_ == LeftMode::Browse;
+    }
+    void filesDropped (const juce::StringArray& files, int, int) override
+    {
+        if (files.isEmpty()) return;
+        juce::File f (files[0]);
+        if (f.isDirectory())
+            navigateTo (f);
+        else if (f.getParentDirectory().isDirectory())
+            navigateTo (f.getParentDirectory());
+    }
+
+    //──────────────────────────────────────────────────────────────────────────
     void resized() override
     {
         auto b = getLocalBounds();
@@ -929,6 +970,21 @@ public:
         plCombo       .setBounds (tabRow.removeFromRight (130).reduced (2, 3));
         pathLabel_    .setBounds (tabRow.reduced (2, 4));
         pathLabel_    .setVisible (leftMode_ == LeftMode::Browse);
+
+        // Quick-location buttons row (Browse mode only)
+        bool browse = (leftMode_ == LeftMode::Browse);
+        if (browse)
+        {
+            auto locRow = leftPanel.removeFromTop (22);
+            int bw = locRow.getWidth() / 4;
+            locHomeBtn_ .setBounds (locRow.removeFromLeft (bw).reduced (1, 2));
+            locMusicBtn_.setBounds (locRow.removeFromLeft (bw).reduced (1, 2));
+            locDeskBtn_ .setBounds (locRow.removeFromLeft (bw).reduced (1, 2));
+            locVolBtn_  .setBounds (locRow.reduced (1, 2));
+        }
+        for (auto* b2 : { &locHomeBtn_, &locMusicBtn_, &locDeskBtn_, &locVolBtn_ })
+            b2->setVisible (browse);
+
         fileList      .setBounds (leftPanel);
 
         // Analysis panel right
@@ -978,6 +1034,9 @@ private:
     juce::File                                     currentDir_;
     juce::TextButton                               upDirBtn_     { juce::CharPointer_UTF8 ("\xe2\x86\x91") };
     juce::Label                                    pathLabel_;
+
+    // Quick-location buttons
+    juce::TextButton locHomeBtn_, locMusicBtn_, locDeskBtn_, locVolBtn_;
 
     // Left-panel tab row
     juce::TextButton browseTabBtn, playlistTabBtn, plRemoveBtn;

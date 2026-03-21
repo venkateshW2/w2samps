@@ -5,6 +5,7 @@
 #include "EuclideanSequencer.h"
 #include "PhaseTransform.h"
 #include "FuncGen.h"
+#include "OnsetHitMapper.h"
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <atomic>
 
@@ -313,39 +314,56 @@ public:
                             const auto& ov = entry->onsets.positions;
                             int nOnsets = (int) ov.size();
 
-                            if (loopMode == GranularVoice::LoopMode::OnsetSeq)
+                            // Check per-hit onset override (OnsetHitMapper)
+                            int8_t mappedOnset = onsetHitMapper_.get (hitCount_);
+                            if (mappedOnset >= 0 && mappedOnset < nOnsets)
                             {
-                                ++onsetIdx_;
-                                for (int tries = 0; tries < nOnsets; ++tries)
+                                float pos = ov[(size_t) mappedOnset];
+                                if (pos >= rgnSt && pos + loopFrac <= rgnEn)
                                 {
-                                    int idx = ((onsetIdx_ + tries) % nOnsets + nOnsets) % nOnsets;
-                                    float pos = ov[(size_t) idx];
-                                    if (pos >= rgnSt && pos + loopFrac <= rgnEn)
-                                    {
-                                        seqLoopAnchorNorm_ = pos;
-                                        onsetIdx_ = idx;
-                                        found = true;
-                                        break;
-                                    }
+                                    seqLoopAnchorNorm_ = pos;
+                                    onsetIdx_ = mappedOnset;
+                                    found = true;
                                 }
                             }
-                            else // OnsetRnd
+
+                            if (!found)
                             {
-                                audioRng_ = audioRng_ * 1664525u + 1013904223u;
-                                int startIdx = (int)((audioRng_ >> 16) % (uint32_t) nOnsets);
-                                for (int tries = 0; tries < nOnsets; ++tries)
+                                if (loopMode == GranularVoice::LoopMode::OnsetSeq)
                                 {
-                                    int idx = (startIdx + tries) % nOnsets;
-                                    float pos = ov[(size_t) idx];
-                                    if (pos >= rgnSt && pos + loopFrac <= rgnEn)
+                                    ++onsetIdx_;
+                                    for (int tries = 0; tries < nOnsets; ++tries)
                                     {
-                                        seqLoopAnchorNorm_ = pos;
-                                        found = true;
-                                        break;
+                                        int idx = ((onsetIdx_ + tries) % nOnsets + nOnsets) % nOnsets;
+                                        float pos = ov[(size_t) idx];
+                                        if (pos >= rgnSt && pos + loopFrac <= rgnEn)
+                                        {
+                                            seqLoopAnchorNorm_ = pos;
+                                            onsetIdx_ = idx;
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                else // OnsetRnd
+                                {
+                                    audioRng_ = audioRng_ * 1664525u + 1013904223u;
+                                    int startIdx = (int)((audioRng_ >> 16) % (uint32_t) nOnsets);
+                                    for (int tries = 0; tries < nOnsets; ++tries)
+                                    {
+                                        int idx = (startIdx + tries) % nOnsets;
+                                        float pos = ov[(size_t) idx];
+                                        if (pos >= rgnSt && pos + loopFrac <= rgnEn)
+                                        {
+                                            seqLoopAnchorNorm_ = pos;
+                                            found = true;
+                                            break;
+                                        }
                                     }
                                 }
                             }
                         }
+                        ++hitCount_; // advance hit counter AFTER reading the mapper
 
                         if (!found)
                         {
@@ -487,6 +505,10 @@ public:
         return destModNorm_[(int) d].load (std::memory_order_relaxed);
     }
 
+    /** Onset hit mapper — message thread reads/writes; audio thread reads non-blocking. */
+    OnsetHitMapper&       getOnsetHitMapper()       { return onsetHitMapper_; }
+    const OnsetHitMapper& getOnsetHitMapper() const { return onsetHitMapper_; }
+
     //==========================================================================
     // Message-thread navigation
 
@@ -504,6 +526,7 @@ private:
             seqLoopAnchorNorm_ = 0.0f;
             seqLoopEndNorm_    = 0.25f;
             onsetIdx_          = -1;
+            hitCount_          = 0;
         }
     }
 
@@ -631,6 +654,10 @@ private:
     float seqLoopAnchorNorm_ = 0.0f;
     float seqLoopEndNorm_    = 1.0f;  // loopEnd kept in sync with anchor
     int   onsetIdx_          = -1;    // current onset index for OnsetSeq mode
+    int   hitCount_          = 0;     // euclidean hit counter (wraps at OnsetHitMapper::kSlots)
+
+    // Per-hit onset index override table (message thread writes, audio thread reads)
+    OnsetHitMapper onsetHitMapper_;
 
     // UI-readable (written by audio thread, read by UI timer)
     std::atomic<double> transformedPhase_     { 0.0 };

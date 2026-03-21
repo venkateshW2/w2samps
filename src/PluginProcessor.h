@@ -203,6 +203,7 @@ public:
     int  getSoloVoice()        const    { return soloVoice_.load(); }
 
     const VoiceChannel& getVoice (int v) const { return voices_[v]; }
+    VoiceChannel&       getVoice (int v)       { return voices_[v]; }
 
     /** Access a voice's FuncGen from the message thread (editor draws + edits). */
     FuncGen& getVoiceFuncGen (int v, int fg) { return voices_[v].getFuncGen (fg); }

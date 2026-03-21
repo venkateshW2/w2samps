@@ -279,17 +279,6 @@ void W2SamplerEditor::buildVoiceUI (int v)
     leftContent_.addAndMakeVisible (ui.playlistCombo);
     leftContent_.addAndMakeVisible (ui.loadPlaylistBtn);
 
-    // Onset sensitivity
-    styleSlider (ui.onsetSensSlider, 0.0f, 1.0f, 0.5f);
-    ui.onsetSensSlider.setDoubleClickReturnValue (true, 0.5);
-    styleLabel  (ui.onsetSensLabel);
-    ui.onsetSensSlider.onDragEnd = [this, v] {
-        float s = (float) voiceUI[v].onsetSensSlider.getValue();
-        proc.reanalyseOnsets (v, s);
-    };
-    leftContent_.addAndMakeVisible (ui.onsetSensSlider);
-    leftContent_.addAndMakeVisible (ui.onsetSensLabel);
-
     // Waveform
     ui.waveform.onRegionStart = [this,v](float val) { *proc.vp[v].regionStart = val; };
     ui.waveform.onRegionEnd   = [this,v](float val) { *proc.vp[v].regionEnd   = val; };
@@ -351,6 +340,10 @@ void W2SamplerEditor::buildVoiceUI (int v)
                                           juce::Colour (on ? kActive : kElevated));
     };
     leftContent_.addAndMakeVisible (ui.loopLockBtn);
+
+    // Onset hit mapper grid
+    ui.onsetMapGrid.setup (proc, v);
+    leftContent_.addAndMakeVisible (ui.onsetMapGrid);
 
     // Phase section
     styleSlider (ui.offsetSlider, 0.0f,  1.0f, p.phaseOffset->get());
@@ -836,6 +829,8 @@ void W2SamplerEditor::hideVoiceAll()
         hide (ui.playlistCombo); hide (ui.loadPlaylistBtn);
         hide (ui.onsetSensSlider); hide (ui.onsetSensLabel);
 
+        hide (ui.onsetMapGrid);
+
         hide (ui.stepsSlider);  hide (ui.stepsLabel);
         hide (ui.hitsSlider);   hide (ui.hitsLabel);
         hide (ui.rotSlider);    hide (ui.rotLabel);
@@ -948,12 +943,10 @@ void W2SamplerEditor::layoutVoicePanel (int v)
             ui.loadPlaylistBtn .setBounds (x0 + panW - btnW, y, btnW,            h); ui.loadPlaylistBtn .setVisible (true);
             y += h + rowGap;
         }
-        // Onset sens + RAW/STCH toggle on same row
+        // RAW/STCH (Bungee) toggle button
         {
-            const int h = 24, btnW = 50;
-            ui.onsetSensLabel .setBounds (x0,                       y, 36,             h); ui.onsetSensLabel .setVisible (true);
-            ui.onsetSensSlider.setBounds (x0 + 38,                  y, panW-38-btnW-4, h); ui.onsetSensSlider.setVisible (true);
-            ui.bungeeBtn      .setBounds (x0 + panW - btnW,         y, btnW,           h); ui.bungeeBtn.setVisible (true);
+            const int h = 24, btnW = 60;
+            ui.bungeeBtn.setBounds (x0 + panW - btnW, y, btnW, h); ui.bungeeBtn.setVisible (true);
             y += h + rowGap;
         }
         // Waveform
@@ -992,6 +985,13 @@ void W2SamplerEditor::layoutVoicePanel (int v)
         ui.loopLockBtn.setBounds (x0 + cw - 108, y, 52, rh - 2); ui.loopLockBtn.setVisible (true);
         ui.freezeBtn.setBounds   (x0 + cw -  52, y, 52, rh - 2); ui.freezeBtn.setVisible (true);
         y += rh + 4;
+
+        // Onset hit map grid (always visible in SEQUENCE section)
+        {
+            const int gridH = 88;
+            ui.onsetMapGrid.setBounds (x0, y, panW, gridH); ui.onsetMapGrid.setVisible (true);
+            y += gridH + 2;
+        }
 
         y += sectionGap;
     }
@@ -1563,8 +1563,11 @@ void W2SamplerEditor::drawMasterColumn (juce::Graphics& g)
 void W2SamplerEditor::timerCallback()
 {
     for (int v = 0; v < 3; ++v)
+    {
         if (proc.takeRandomizeFXRequest (v))
             proc.randomizeVoiceParams (v, voiceUI[v].rndLocked);
+        voiceUI[v].onsetMapGrid.refresh();
+    }
 
     // Refresh playlist combos every ~2s (playlist list can change while browser is open)
     static int plRefreshCounter = 0;
