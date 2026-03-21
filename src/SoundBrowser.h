@@ -517,20 +517,40 @@ public:
     explicit SoundBrowserContent (W2SamplerProcessor& p) : proc_ (p)
     {
         // Toolbar
-        for (auto* b : { &addFileBtn, &addFolderBtn, &analyseAllBtn, &rebuildBtn, &removeBtn })
+        for (auto* b : { &addFileBtn, &addFolderBtn, &analyseAllBtn, &rebuildBtn })
             addAndMakeVisible (b);
         addFileBtn   .onClick = [this] { pickFiles(); };
         addFolderBtn .onClick = [this] { pickFolder(); };
         analyseAllBtn.onClick = [this] { analyseAll(); };
         rebuildBtn   .onClick = [this] { triggerRebuildCorpus(); };
-        removeBtn    .onClick = [this] { removeSelected(); };
-        removeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff3A1A1A));
 
-        // File list
+        // Left-panel tab row: [Browse] [Playlist] | combo | [Remove]
+        addAndMakeVisible (browseTabBtn);
+        addAndMakeVisible (playlistTabBtn);
+        browseTabBtn  .setButtonText ("Browse");
+        playlistTabBtn.setButtonText ("Playlist");
+        browseTabBtn  .setClickingTogglesState (false);
+        playlistTabBtn.setClickingTogglesState (false);
+        browseTabBtn  .onClick = [this] { setLeftMode (LeftMode::Browse); };
+        playlistTabBtn.onClick = [this] { setLeftMode (LeftMode::Playlist); };
+
+        addAndMakeVisible (plCombo);
+        plCombo.setTextWhenNothingSelected ("— no playlist —");
+        plCombo.onChange = [this] { onPlaylistComboChanged(); };
+        refreshPlaylistCombo();
+
+        addAndMakeVisible (plRemoveBtn);
+        plRemoveBtn.setButtonText ("Remove");
+        plRemoveBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff3A1A1A));
+        plRemoveBtn.onClick = [this] { removeFromPlaylist(); };
+
+        // File list — used for both Browse and Playlist mode (getNumRows/paint checks mode)
         addAndMakeVisible (fileList);
         fileList.setModel (this);
         fileList.setRowHeight (22);
         fileList.setColour (juce::ListBox::backgroundColourId, juce::Colour (0xff1A1A1E));
+
+        updateTabAppearance();
 
         // Waveform
         addAndMakeVisible (waveComp);
@@ -640,23 +660,13 @@ public:
         addAndMakeVisible (corpusView);
         corpusView.onSelect = [this] (int fileIdx) { selectFileRow (fileIdx); };
 
-        // ── Playlist strip (below waveform) ───────────────────────────────────
-        addAndMakeVisible (plLabel);
-        plLabel.setText ("Playlist:", juce::dontSendNotification);
-        plLabel.setFont (juce::Font (juce::FontOptions{}.withHeight (11.f)));
-        plLabel.setColour (juce::Label::textColourId, juce::Colour (0xff8E8E93));
-
-        addAndMakeVisible (plCombo);
-        plCombo.setTextWhenNothingSelected ("— select or create —");
-        plCombo.onChange = [this] { onPlaylistComboChanged(); };
-        refreshPlaylistCombo();
-
+        // ── Playlist controls below waveform ─────────────────────────────────
         addAndMakeVisible (plAddBtn);
-        plAddBtn.setButtonText ("+ Add");
+        plAddBtn.setButtonText ("+ Add to Playlist");
         plAddBtn.onClick = [this] { addSelectedToPlaylist(); };
 
         addAndMakeVisible (plNewBtn);
-        plNewBtn.setButtonText ("New");
+        plNewBtn.setButtonText ("New Playlist");
         plNewBtn.onClick = [this] { createNewPlaylist(); };
 
         // Status label
@@ -692,10 +702,20 @@ public:
     ~SoundBrowserContent() override { stopTimer(); proc_.stopPreview(); }
 
     //──────────────────────────────────────────────────────────────────────────
-    int getNumRows() override { return SampleDatabase::instance().size(); }
+    int getNumRows() override
+    {
+        if (leftMode_ == LeftMode::Playlist) return currentPlaylist_.size();
+        return SampleDatabase::instance().size();
+    }
 
     void paintListBoxItem (int row, juce::Graphics& g, int w, int h, bool sel) override
     {
+        if (leftMode_ == LeftMode::Playlist)
+        {
+            paintPlaylistRow (row, g, w, h, sel);
+            return;
+        }
+
         auto& entries = SampleDatabase::instance().getEntries();
         if (row < 0 || row >= (int)entries.size()) return;
         const auto& e = entries[(size_t)row];
@@ -703,32 +723,21 @@ public:
         if (sel) g.fillAll (juce::Colour (0xff30D158).withAlpha (0.22f));
         else if (row % 2 == 0) g.fillAll (juce::Colour (0xff1E1E22));
 
-        // Cluster / status strip
-        if (e.valid)
-        {
-            int ci = (e.cluster >= 0 && e.cluster < 8) ? e.cluster : 7;
-            g.setColour (juce::Colour (kClusterCols[ci]));
-        }
-        else
-            g.setColour (juce::Colour (0xff555558));
+        if (e.valid) { int ci = (e.cluster >= 0 && e.cluster < 8) ? e.cluster : 7;
+                       g.setColour (juce::Colour (kClusterCols[ci])); }
+        else           g.setColour (juce::Colour (0xff555558));
         g.fillRect (0, 2, 4, h - 4);
 
-        // Status icon
         g.setFont (10.f);
-        if (!e.valid)
-        {
-            g.setColour (juce::Colour (0xff888888));
-            g.drawText ("...", 8, 0, 18, h, juce::Justification::centredLeft);
-        }
+        if (!e.valid) { g.setColour (juce::Colour (0xff888888));
+                        g.drawText ("...", 8, 0, 18, h, juce::Justification::centredLeft); }
 
-        // Name
         g.setColour (e.valid ? juce::Colour (0xffE0E0E5) : juce::Colour (0xff888888));
         g.setFont (11.f);
         int nameX = e.valid ? 10 : 26;
         g.drawText (e.file.getFileNameWithoutExtension(), nameX, 0, w - 160, h,
                     juce::Justification::centredLeft, true);
 
-        // Key + BPM
         if (e.valid || e.metaBpm > 0.f || e.metaKey.isNotEmpty())
         {
             juce::String key  = e.valid ? e.keyName : e.metaKey;
@@ -739,9 +748,78 @@ public:
         }
     }
 
+    void paintPlaylistRow (int row, juce::Graphics& g, int w, int h, bool sel)
+    {
+        SampleEntry e;
+        bool ok = currentPlaylist_.getEntry (row, e);
+
+        if (sel) g.fillAll (juce::Colour (0xff0A84FF).withAlpha (0.22f));
+        else if (row % 2 == 0) g.fillAll (juce::Colour (0xff1E1E22));
+
+        // Cluster colour strip
+        int ci = (e.cluster >= 0 && e.cluster < 8) ? e.cluster : 7;
+        g.setColour (ok ? juce::Colour (kClusterCols[ci]) : juce::Colour (0xff555558));
+        g.fillRect (0, 2, 4, h - 4);
+
+        // File path indicator — small dot if file exists on disk
+        bool exists = ok && juce::File (currentPlaylist_.getFilePath (row)).existsAsFile();
+        g.setColour (exists ? juce::Colour (0xff30D158) : juce::Colour (0xffFF453A));
+        g.fillEllipse (7.f, (float)h * 0.5f - 3.f, 6.f, 6.f);
+
+        // Name
+        g.setColour (juce::Colour (0xffE0E0E5));
+        g.setFont (11.f);
+        juce::String name = ok ? currentPlaylist_.getEntryName (row) : "—";
+        g.drawText (name, 18, 0, w - 170, h, juce::Justification::centredLeft, true);
+
+        // Key + BPM (from embedded analysis)
+        if (ok && e.valid)
+        {
+            juce::String meta = e.keyName
+                                + (e.tempo > 0.f ? "  " + juce::String (e.tempo, 0) + " bpm" : "");
+            g.setColour (juce::Colour (0xff6E6E73)); g.setFont (10.f);
+            g.drawText (meta, w - 158, 0, 154, h, juce::Justification::centredRight, true);
+        }
+    }
+
     // Use only selectedRowsChanged — listBoxItemClicked would fire twice per click
     void listBoxItemClicked  (int, const juce::MouseEvent&) override {}
-    void selectedRowsChanged (int lastRow)                  override { selectFileRow (lastRow); }
+    void selectedRowsChanged (int lastRow) override
+    {
+        if (leftMode_ == LeftMode::Playlist)
+        {
+            selectedPlaylistRow_ = lastRow;
+            // Load the file from the playlist for preview / waveform
+            SampleEntry e;
+            if (currentPlaylist_.getEntry (lastRow, e))
+            {
+                proc_.stopPreview();
+                previewBufPtr_     = nullptr;
+                previewSampleRate_ = 44100.0;
+                waveComp.clear();
+                // Show waveform + analysis from embedded playlist data
+                waveComp.setLoading (true);
+                juce::File f = e.file;
+                int gen      = ++waveLoadGeneration_;
+                worker_.addWaveformJob (f, [this, gen, e]
+                    (std::shared_ptr<juce::AudioBuffer<float>>, double sr, WaveThumb thumb)
+                {
+                    if (gen != waveLoadGeneration_) return;
+                    waveLoading_ = false;
+                    waveComp.setLoading (false);
+                    previewSampleRate_ = sr;
+                    waveComp.setBuffer (std::move (thumb), e.analysis.onsetPositions);
+                    waveComp.setSliceRegion (-1.f, -1.f);
+                });
+                // Show analysis panel from embedded data (no SampleDatabase lookup needed)
+                showPlaylistEntryAnalysis (e);
+            }
+        }
+        else
+        {
+            selectFileRow (lastRow);
+        }
+    }
 
     //──────────────────────────────────────────────────────────────────────────
     void resized() override
@@ -759,15 +837,20 @@ public:
         addFolderBtn.setBounds (top.removeFromLeft (62).reduced (2, 5));
         analyseAllBtn.setBounds(top.removeFromLeft (80).reduced (2, 5));
         rebuildBtn  .setBounds (top.removeFromLeft (108).reduced (2, 5));
-        removeBtn   .setBounds (top.removeFromLeft (62).reduced (2, 5));
 
         // Corpus at bottom
         corpusView.setBounds (b.removeFromBottom (corpusH_));
         vBar       .setBounds (b.removeFromBottom (barSz));
 
-        // File list left
-        fileList.setBounds (b.removeFromLeft (listW_));
-        hBar1   .setBounds (b.removeFromLeft (barSz));
+        // Left panel: tab row + list
+        auto leftPanel = b.removeFromLeft (listW_);
+        hBar1.setBounds (b.removeFromLeft (barSz));
+        auto tabRow = leftPanel.removeFromTop (26);
+        browseTabBtn  .setBounds (tabRow.removeFromLeft (58).reduced (1, 2));
+        playlistTabBtn.setBounds (tabRow.removeFromLeft (62).reduced (1, 2));
+        plRemoveBtn   .setBounds (tabRow.removeFromRight (58).reduced (1, 2));
+        plCombo       .setBounds (tabRow.reduced (2, 3));
+        fileList      .setBounds (leftPanel);
 
         // Analysis panel right
         auto right = b.removeFromRight (analysisW_);
@@ -798,19 +881,25 @@ private:
     int analysisW_ = 210;
     int corpusH_  = 200;
 
+    // Left-panel mode
+    enum class LeftMode { Browse, Playlist };
+    LeftMode leftMode_ = LeftMode::Browse;
+    int      selectedPlaylistRow_ = -1;
+
     // Toolbar
     juce::TextButton addFileBtn   { "+File" };
     juce::TextButton addFolderBtn { "+Folder" };
     juce::TextButton analyseAllBtn{ "Analyse All" };
     juce::TextButton rebuildBtn   { "Rebuild Corpus" };
-    juce::TextButton removeBtn    { "Remove" };
     juce::Label      statusLabel;
 
-    // Playlist strip (below waveform)
-    juce::Label      plLabel;
+    // Left-panel tab row
+    juce::TextButton browseTabBtn, playlistTabBtn, plRemoveBtn;
     juce::ComboBox   plCombo;
+
+    // Playlist controls (below waveform)
     juce::TextButton plAddBtn, plNewBtn;
-    Playlist         currentPlaylist_;     // the playlist currently shown in plCombo
+    Playlist         currentPlaylist_;
 
     // Controls bar
     juce::TextButton analyseBtn { "Analyse" };
@@ -994,11 +1083,8 @@ private:
     void layoutPlaylistRow (juce::Rectangle<int> r)
     {
         r = r.reduced (2, 3);
-        plLabel .setBounds (r.removeFromLeft (54));
-        plAddBtn.setBounds (r.removeFromRight (46).reduced (1, 1));
-        plNewBtn.setBounds (r.removeFromRight (46).reduced (1, 1));
-        r.removeFromRight (4);
-        plCombo .setBounds (r);
+        plNewBtn.setBounds (r.removeFromRight (88).reduced (1, 1));
+        plAddBtn.setBounds (r.reduced (0, 1));
     }
 
     //──────────────────────────────────────────────────────────────────────────
@@ -1188,6 +1274,75 @@ private:
     }
 
     //──────────────────────────────────────────────────────────────────────────
+    void setLeftMode (LeftMode m)
+    {
+        leftMode_ = m;
+        selectedPlaylistRow_ = -1;
+        updateTabAppearance();
+        fileList.updateContent();
+        fileList.deselectAllRows();
+        fileList.repaint();
+    }
+
+    void updateTabAppearance()
+    {
+        bool pl = (leftMode_ == LeftMode::Playlist);
+        browseTabBtn  .setColour (juce::TextButton::buttonColourId,
+                                  pl ? juce::Colour (0xff2A2A2E) : juce::Colour (0xff30D158).withAlpha (0.3f));
+        playlistTabBtn.setColour (juce::TextButton::buttonColourId,
+                                  pl ? juce::Colour (0xff0A84FF).withAlpha (0.3f) : juce::Colour (0xff2A2A2E));
+        plRemoveBtn.setVisible (pl);
+    }
+
+    /** Show analysis panel from a Playlist entry (no SampleDatabase lookup). */
+    void showPlaylistEntryAnalysis (const SampleEntry& e)
+    {
+        if (!e.valid)
+        {
+            for (auto* l : { &keyDetLabel, &keyMetaLabel, &bpmLabel, &onsetLabel, &pitchLabel })
+                l->setText ("", juce::dontSendNotification);
+            return;
+        }
+        keyDetLabel .setText ("Key (analysis): " + e.keyName
+                              + "  (" + juce::String (e.keyConf, 2) + ")",
+                              juce::dontSendNotification);
+        keyMetaLabel.setText (e.metaKey.isNotEmpty() ? "Key (metadata): " + e.metaKey : "Key (metadata): —",
+                              juce::dontSendNotification);
+        juce::String bpmStr = "BPM: " + (e.tempo > 0.f ? juce::String (e.tempo, 1) : juce::String ("—"));
+        if (e.metaBpm > 0.f) bpmStr += "   meta: " + juce::String (e.metaBpm, 1);
+        bpmLabel .setText (bpmStr, juce::dontSendNotification);
+        onsetLabel.setText ("Onsets: " + juce::String ((int)e.analysis.onsetPositions.size()),
+                            juce::dontSendNotification);
+        if (e.analysis.pitchHz > 0.f)
+            pitchLabel.setText ("Pitch: " + juce::String (e.analysis.pitchHz, 1)
+                                + " Hz  (" + juce::String (e.analysis.pitchConfidence, 2) + ")",
+                                juce::dontSendNotification);
+        else
+            pitchLabel.setText ("", juce::dontSendNotification);
+        repaint (mfccBounds_);
+    }
+
+    void removeFromPlaylist()
+    {
+        if (selectedPlaylistRow_ < 0 || selectedPlaylistRow_ >= currentPlaylist_.size()) return;
+        SampleEntry e;
+        if (!currentPlaylist_.getEntry (selectedPlaylistRow_, e)) return;
+        currentPlaylist_.removeEntry (e.hash);
+        currentPlaylist_.save();
+        selectedPlaylistRow_ = juce::jlimit (-1, currentPlaylist_.size() - 1,
+                                             selectedPlaylistRow_ - 1);
+        fileList.updateContent();
+        fileList.repaint();
+        if (selectedPlaylistRow_ >= 0)
+            fileList.selectRow (selectedPlaylistRow_, false, true);
+        else
+        {
+            waveComp.clear();
+            for (auto* l : { &keyDetLabel, &keyMetaLabel, &bpmLabel, &onsetLabel, &pitchLabel })
+                l->setText ("", juce::dontSendNotification);
+        }
+    }
+
     void analyseSelected()
     {
         auto& entries = SampleDatabase::instance().getEntries();
@@ -1303,6 +1458,13 @@ private:
 
     void sendToVoice (int v)
     {
+        if (leftMode_ == LeftMode::Playlist)
+        {
+            SampleEntry e;
+            if (currentPlaylist_.getEntry (selectedPlaylistRow_, e))
+                proc_.loadSingleFileWithAnalysis (v, e.file, e.analysis);
+            return;
+        }
         auto& entries = SampleDatabase::instance().getEntries();
         if (selectedFileIdx_ < 0 || selectedFileIdx_ >= (int)entries.size()) return;
         const auto& e = entries[(size_t)selectedFileIdx_];
@@ -1349,12 +1511,15 @@ private:
         if (sel.isEmpty()) return;
         if (currentPlaylist_.name == sel) return;
 
-        // Save current if dirty
         if (currentPlaylist_.isDirty()) currentPlaylist_.save();
 
         Playlist pl;
         if (Playlist::load (sel, pl))
+        {
             currentPlaylist_ = std::move (pl);
+            // Switch to Playlist mode so user sees the contents immediately
+            setLeftMode (LeftMode::Playlist);
+        }
     }
 
     void createNewPlaylist()
@@ -1382,6 +1547,7 @@ private:
                         int idx = names.indexOf (name);
                         if (idx >= 0)
                             plCombo.setSelectedItemIndex (idx, juce::dontSendNotification);
+                        setLeftMode (LeftMode::Playlist);
                     }
                 }
                 delete dialog;
@@ -1390,32 +1556,33 @@ private:
 
     void addSelectedToPlaylist()
     {
-        if (currentPlaylist_.name.isEmpty())
-        {
-            // No playlist selected — prompt to create one
-            createNewPlaylist();
-            return;
-        }
+        if (currentPlaylist_.name.isEmpty()) { createNewPlaylist(); return; }
 
+        // Get the entry to add — from browse mode only (in playlist mode button is less relevant)
+        if (leftMode_ != LeftMode::Browse) return;
         auto& entries = SampleDatabase::instance().getEntries();
         if (selectedFileIdx_ < 0 || selectedFileIdx_ >= (int)entries.size()) return;
         const auto& e = entries[(size_t)selectedFileIdx_];
 
         if (!e.valid)
         {
-            // Queue analysis first — not yet analysed
             worker_.addFileJob (e.file, (float)sensSlider.getValue());
-            juce::AlertWindow::showMessageBoxAsync (
-                juce::AlertWindow::InfoIcon, "Not Yet Analysed",
-                "Queueing analysis. Re-add to playlist after analysis completes.");
+            statusLabel.setText ("Queued for analysis — add to playlist when done",
+                                 juce::dontSendNotification);
             return;
         }
 
         currentPlaylist_.addEntry (e);
         currentPlaylist_.save();
-
         statusLabel.setText ("Added to \"" + currentPlaylist_.name + "\"",
                              juce::dontSendNotification);
+
+        // Refresh playlist list if visible
+        if (leftMode_ == LeftMode::Playlist)
+        {
+            fileList.updateContent();
+            fileList.repaint();
+        }
     }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SoundBrowserContent)
