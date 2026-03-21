@@ -1,7 +1,7 @@
 # CLAUDE.md — W2 Audio Plugs
 
 Context file for Claude Code. Read this before making changes.
-Last updated: 2026-03-20 (session 4 — UI complete, moving to audio features)
+Last updated: 2026-03-21 (session 6 — Bungee integrated, FluCoMa sampler intelligence phase starting)
 
 ---
 
@@ -9,13 +9,13 @@ Last updated: 2026-03-20 (session 4 — UI complete, moving to audio features)
 
 A JUCE 8 audio plugin + standalone app.
 
-**Current state (v1.0-pre):** Three-voice phasor-based polyrhythmic granular sampler.
-Onset detection, key detection, LUFS metering, gain structure, FX presets, and
-randomization with per-slot locks are all implemented and building cleanly.
-UI redesign complete: dark theme, three-column layout, concentric ring sequencer,
-scrollable accordion left panel, resizable window.
-**Next phase:** Audio synthesis features — envelopes, FM synthesis, wavetable.
-**Long-term:** ONNX-based ML analysis.
+**Current state (v1.1):** Three-voice phasor-based polyrhythmic granular sampler.
+Phase 1 complete: phasor clock, 3 VoiceChannels, GranularVoice (6 loop modes),
+onset detection, key detection, LUFS metering, FX presets, randomization,
+Timeline Envelope modulator (8 lanes, multi-dest, DAW-style zoom),
+Bungee time-stretch integration (pitch independent of speed, per-voice RAW/STCH switch).
+**Current phase:** Phase 2 — FluCoMa Sampler Intelligence System.
+**Long-term:** ONNX-based ML analysis, HTML/JS UI (CHOC/WebView).
 
 Long-term goal: ML-powered instrument. UI will eventually move to HTML/JS
 (WebView / CHOC). For now: JUCE native Components, three-column layout.
@@ -44,14 +44,32 @@ Outputs in `build/W2Sampler_artefacts/Debug/`:
 
 ## Source Files — Current State
 
-| File                        | Purpose                                                   |
-| --------------------------- | --------------------------------------------------------- |
-| `CMakeLists.txt`            | Entire build: FetchContent deps, JUCE plugin, source list |
-| `src/EuclideanSequencer.h`  | Bjorklund algorithm — header-only, no JUCE                |
-| `src/SamplerVoice.h`        | DSP chain: sample + ADSR + distortion + filter + reverb   |
-| `src/SampleLibrary.h`       | Pre-loads a folder into memory, manages navigation        |
-| `src/PluginProcessor.h/cpp` | AudioProcessor: params, clock, coordinates DSP            |
-| `src/PluginEditor.h/cpp`    | JUCE UI: 620×430, waveform, sliders, step grid            |
+| File                        | Purpose                                                                     |
+| --------------------------- | --------------------------------------------------------------------------- |
+| `CMakeLists.txt`            | Build: FetchContent JUCE 8.0.7 + clap-juce-extensions + Bungee             |
+| `src/MasterClock.h`         | Phasor clock: 0→1 ramp at BPM rate, beatsPerCycle param                    |
+| `src/PhaseTransform.h`      | Per-voice: rate × offset × warp × reverse × step-quantise                  |
+| `src/EuclideanSequencer.h`  | Bjorklund algorithm — header-only, no JUCE                                  |
+| `src/GranularVoice.h`       | DSP: sample read + loop modes + ADSR + FX chain + Bungee pitch path         |
+| `src/VoiceChannel.h`        | One voice: SampleLibrary + GranularVoice + sequencer state + phase compute  |
+| `src/SampleLibrary.h`       | Pre-loads folder into memory, onset/key analysis results per entry          |
+| `src/OnsetDetector.h`       | Spectral flux onset detection (to be replaced by FluCoMa in Phase 2)       |
+| `src/KeyDetector.h`         | Goertzel chromagram + Krumhansl-Kessler key detection (Phase 2: FluCoMa)   |
+| `src/FuncGen.h`             | Function generator: Catmull-Rom spline, 512-entry LUT, 18 mod destinations  |
+| `src/TimelineEnv.h`         | Macro-scale envelope: 8 lanes, per-lane rate, seek, multi-dest routing      |
+| `src/PluginProcessor.h/cpp` | AudioProcessor: all params, clock, voice coordination, timeline tick        |
+| `src/PluginEditor.h/cpp`    | Full UI: transport bar, left accordion, concentric rings, master column     |
+
+**Planned new files (Phase 2):**
+
+| File                        | Purpose                                                                     |
+| --------------------------- | --------------------------------------------------------------------------- |
+| `src/FluCoMaAnalyser.h`     | Offline analysis: OnsetSlice + MFCC + Chroma + SpectralShape + Pitch       |
+| `src/SampleDatabase.h`      | JSON-backed store of all analysed files; KMeans + UMAP corpus               |
+| `src/SoundBrowser.h/cpp`    | Detachable DocumentWindow: file list, waveform, analysis panel, 2D corpus   |
+| `src/Playlist.h`            | Named collection of analysed file paths; JSON serialisation                 |
+| `src/CorpusView.h`          | 2D UMAP scatter plot component; click-to-audition, box-select, zoom/pan     |
+| `src/OnsetHitMapper.h`      | Per-hit onset index table (32 hits × onset index); UI grid component        |
 
 ---
 
@@ -593,62 +611,181 @@ LCG RNG (`audioRng_`) used on audio thread (no shared state).
 - [x] **Rate/step-count decoupled**: rate now applied to phasor delta (not instantaneous value), so all seqSteps always fire per voice cycle regardless of rate setting. `/2` plays all 16 steps at half speed; was previously capped to 8 steps.
 - [x] Meter panel (master tab right side) restyled to match light theme (kPanel bg, kTrack borders, kText labels)
 
-### Phase 2 — Audio Synthesis (NEXT)
+### Phase 1.x — Recent Additions (2026-03-21) ✓
 
-User confirmed: "this is last bit then audio stuff" / "i want to move ahead with developing other stuff like envelopes fm synths and wavetable stuff."
+#### Timeline Envelope ✓
+- [x] `src/TimelineEnv.h` — 8 lanes, per-lane rateMultiplier + seekRequest atomic
+- [x] `src/FuncGen.h` — Catmull-Rom spline, 512-entry LUT, kMaxPoints=32, evaluateSmooth()
+- [x] 18 ModDest entries incl. Rate/PhaseOffset/Warp/SeqSteps/SeqHits/SeqRotation
+- [x] TimelineView: DAW-style fixed-window zoom, PlayheadOverlay, 2 default lanes + Add Lane
+- [x] Inspector strip: per-dest rows with Voice/Dest ComboBox + Depth/Min/Max sliders
+- [x] Column headers (Depth/Min/Max) each centred over their slider
 
-#### 2.1 — Envelope Designer
+#### Bungee Pitch-Shift ✓
+- [x] Bungee (MPL-2.0) via CMake FetchContent; target `bungee_library`
+- [x] `GranularVoice::Params::bungeeEnabled` — false=raw (pitch=speed), true=Bungee
+- [x] Bungee path: speed=sourceRate/sampleRate, pitch=semitone ratio, fully decoupled
+- [x] Grain loop: specifyGrain → fill loop-wrapped source → analyseGrain → synthesiseGrain
+- [x] `v0_bungee / v1_bungee / v2_bungee` AudioParameterBool per voice
+- [x] RAW/STCH toggle button in SAMPLE section (onset-sens row, right side)
+- [x] BPM: vertical drag + velocity mode + double-click AlertWindow for text entry
+
+---
+
+### Phase 2 — FluCoMa Sampler Intelligence (CURRENT)
+
+**Goal:** Replace the basic folder-based sample browser with a full analysis-backed
+intelligent sampler: FluCoMa descriptors, JSON cache, Sound Browser window,
+Playlist system, per-hit onset mapping, and 2D corpus visualization.
+
+**Key constraint:** FluCoMa analysis runs **offline on the message thread only**.
+Audio thread never touches FluCoMa objects. Results flow via JSON + atomic flags.
+
+#### Design decisions for Phase 2 (locked)
+
+| Decision | Choice | Reason |
+|---|---|---|
+| FluCoMa scope | Analysis only (offline). Not real-time DSP. | Audio thread safety |
+| Analysis cache | JSON file per audio file, stored in `~/.w2sampler/cache/<hash>.json` | Survives across sessions; re-run only on hash change |
+| SampleDatabase owner | Singleton owned by PluginProcessor, shared to editor by pointer | Single source of truth; no duplication |
+| Sound Browser | Separate `juce::DocumentWindow` (detachable) | Needs space; doesn't compete with voice tabs |
+| Playlist | Named JSON list of absolute paths + analysis refs | Cross-folder; genre/instrument collections |
+| Voice sample source | Either folder (legacy) OR playlist (new); toggle in SAMPLE section | Backwards-compatible |
+| Onset Hit Mapper | `int8_t onsetHitMap[32]` per voice; -1 = auto (OnsetSeq/Rnd), 0–127 = specific onset | Transparent; -1 preserves existing behaviour |
+| Onset Hit Mapper UI | Grid below sequencer: columns = euclidean hits, rows = onset indices; one dot per column | Each hit maps to exactly one onset; ring still decides timing |
+| UMAP + KMeans | Run after all files in a playlist/folder are analysed; rebuild on demand | Expensive; not per-file |
+| CorpusView | Custom JUCE component; dots = files, position = UMAP 2D, color = cluster | Lives in Sound Browser bottom panel; optional on Master tab |
+| FluCoMa CMake | `flucoma-core` via FetchContent; Eigen URL override to fix deprecated URL (issue #51) | Consistent with existing FetchContent pattern |
+
+#### 2.A — Immediate Fixes (before FluCoMa) ← START HERE
+- [ ] Remove BPM slider visual; replace with static label + double-click text entry only
+- [ ] Tap Tempo button in transport bar: tracks last 4 tap timestamps → sets BPM
+- [ ] Beat indicator: small blinking dot in transport bar, pulses on each master clock beat
+- [ ] Click sound: short synthesised sine blip (~5ms) injected into audio stream on each tap
+- [ ] Fix OnsetSeq/OnsetRnd Bungee path: exhaustion check uses `lStart + loopSizeSamples` not `lEnd`
+- [ ] OnsetSeq/Rnd one-shot confirmed: grain plays for loopSizeMs then stops; no internal loop
+
+#### 2.B — FluCoMa CMake + FluCoMaAnalyser
+- [ ] Add `flucoma-core` via FetchContent (fix Eigen URL: gitlab.com/libeigen/eigen.git tag 3.4.0)
+- [ ] `src/FluCoMaAnalyser.h` — offline analysis struct (message thread only):
+  - [ ] `OnsetSlice` with metric 9 (complex domain, best general-purpose)
+  - [ ] `MFCC` — 13 coefficients; aggregate mean + std via `BufStats`
+  - [ ] `Chroma` — 24 bins; aggregate mean
+  - [ ] `SpectralShape` — centroid, rolloff, flatness, crest; aggregate mean
+  - [ ] `PitchDetection` — F0 + confidence
+  - [ ] Returns `AnalysisResult` struct (flat descriptor vector + onset positions + BPM + key)
+- [ ] Replace `src/OnsetDetector.h` calls with FluCoMaAnalyser (onset positions only)
+- [ ] Replace `src/KeyDetector.h` calls with FluCoMaAnalyser (pitch/chroma → key)
+
+#### 2.C — SampleDatabase
+- [ ] `src/SampleDatabase.h` — singleton, message thread only:
+  - [ ] `Entry` struct: file path, hash, duration, tempo, key, confidence, onset positions,
+        descriptor vector (float[50]), umap2d [2], cluster ID
+  - [ ] `analyse(path, sensitivity)` — runs FluCoMaAnalyser, stores result, writes JSON cache
+  - [ ] `loadFromCache(path)` — reads JSON if hash matches, skips re-analysis
+  - [ ] `buildCorpus()` — runs KMeans (8 clusters) + UMAP on all entries' descriptor vectors
+  - [ ] JSON schema: `{ file, hash, analysedAt, duration, tempo, key, onsets{}, descriptors{}, umap2d[], cluster }`
+  - [ ] Cache location: `~/.w2sampler/cache/<sha256(path)>.json`
+
+#### 2.D — Sound Browser Window
+- [ ] `src/SoundBrowser.h/cpp` — `juce::DocumentWindow`, dark theme, resizable
+- [ ] Three panels:
+  - [ ] **Left** — file list: [+ File] [+ Folder] [+ Multi] [New Playlist] [Load Playlist] buttons;
+        list of entries (name, key, BPM, cluster colour dot); click = select + preview
+  - [ ] **Centre** — waveform display with onset tick marks (colour-coded by cluster);
+        [Play] [Stop] [Analyse] buttons; analysis progress indicator
+  - [ ] **Right** — analysis panel: key + confidence, BPM, onset count, LUFS, peak dB,
+        MFCC bar chart (13 bars), centroid frequency, cluster badge;
+        [Send to V1] [Send to V2] [Send to V3] buttons
+- [ ] **Bottom** — `CorpusView` 2D scatter (UMAP); see §2.H
+- [ ] [Browse] button in transport bar opens/focuses Sound Browser
+
+#### 2.E — Playlist System
+- [ ] `src/Playlist.h` — named collection of SampleDatabase paths
+- [ ] JSON: `{ "name": "Afrobeat Kicks", "files": ["/abs/path/a.wav", ...] }`
+- [ ] Stored in `~/.w2sampler/playlists/`; enumerate all on startup
+- [ ] Sound Browser: [New Playlist] creates empty playlist; drag files in; [Save] persists
+- [ ] Per voice in SAMPLE section: toggle between "Folder" and "Playlist" source;
+      playlist picker shows dropdown of saved playlists
+- [ ] Sample advance modes (Hold/Sequential/Random) apply within the playlist
+
+#### 2.F — Onset Hit Mapper
+- [ ] `src/OnsetHitMapper.h` — `int8_t map[32]` (hit index → onset index; -1 = auto)
+- [ ] VoiceChannel holds one OnsetHitMapper per voice
+- [ ] During trigger: if `loopMode == OnsetSeq || OnsetRnd` and `map[hitCount % 32] >= 0`,
+      seek GranularVoice to `onsets[map[hitCount % 32]]` instead of auto-advance
+- [ ] UI — grid component in SEQUENCE section, visible when loopMode = OnsetSeq/OnsetRnd:
+  - [ ] Columns = euclidean hit count (up to 16 hits shown)
+  - [ ] Rows = onset indices (up to 16 onsets shown, scrollable)
+  - [ ] One selected row per column (click cell = assign; click selected = clear to -1)
+  - [ ] Onset rows colour-coded by cluster (from SampleDatabase)
+  - [ ] "Auto" row at top = -1 (default, uses OnsetSeq/Rnd auto-advance)
+- [ ] AudioParameter: `v0_onsetMap` stored as comma-separated ints in a string param
+
+#### 2.G — 2D Corpus View
+- [ ] `src/CorpusView.h` — custom JUCE Component
+- [ ] Renders UMAP 2D coordinates from SampleDatabase entries as scatter plot
+- [ ] Each dot: position = umap2d[x,y], colour = cluster colour, size = loudness (LUFS)
+- [ ] Click dot: selects file, previews it, shows analysis in right panel
+- [ ] Hover: tooltip with file name + key + BPM
+- [ ] Box-select: drag rectangle to multi-select; [Add to Playlist] button
+- [ ] Zoom (mouse wheel) + pan (drag background)
+- [ ] [Rebuild Corpus] button: re-runs KMeans + UMAP on all current entries
+- [ ] Lives in Sound Browser bottom panel; optionally in Master tab center
+
+---
+
+### Phase 3 — Audio Synthesis (deferred from original Phase 2)
+
+#### 3.1 — Envelope Designer
 - [ ] Multi-segment drawable envelope (ADSR extended to N breakpoints)
-- [ ] Envelope drawn in a small canvas component (click + drag to add/move points)
+- [ ] Envelope drawn in a canvas component (click + drag to add/move points)
 - [ ] Assignable to pitch, filter freq, amplitude, drive, reverb mix
 - [ ] Triggered per voice hit; follows loopSizeMs for total duration
 
-#### 2.2 — Ratcheting + Swing
-- [ ] Ratchet count per step (1–8 sub-divisions; fires ratchet times per euclidean hit)
-- [ ] Ratchet probability (0–1; each ratchet fires with this chance)
-- [ ] Swing amount (0–0.5); shifts every other 16th note by swing × step duration
-- [ ] Swing is a per-voice param, applied during phase transform step
+#### 3.2 — Ratcheting + Swing
+- [ ] Ratchet count per step (1–8 sub-divisions per euclidean hit)
+- [ ] Ratchet probability (0–1)
+- [ ] Swing amount (0–0.5); applied in phase transform step
 
-#### 2.3 — FM Synthesis Voice (new voice type)
-- [ ] FM operator: carrier + modulator oscillator pair (sine, saw, square waveforms)
-- [ ] Modulation index param (0–20); modulator amplitude controls timbre
-- [ ] Ratio param (modulator:carrier frequency ratio, e.g. 1:1, 2:1, 3:2)
-- [ ] Triggered per euclidean hit; uses same ADSR + FX chain
-- [ ] Voice type selector per voice: Sample / FM / Wavetable
+#### 3.3 — FM Synthesis Voice
+- [ ] Voice type selector: Sample / FM / Wavetable per voice
+- [ ] FM: carrier + modulator pair; modulation index; frequency ratio
+- [ ] Same ADSR + FX chain as sample voice
 
-#### 2.4 — Wavetable Voice (new voice type)
-- [ ] Load single-cycle waveform files (WAV) into a wavetable
-- [ ] Morph position param (0–1 scans through loaded wavetables)
-- [ ] Pitch tracked from MIDI or fixed note param
-- [ ] Anti-aliased playback (bandlimited wavetable per octave)
+#### 3.4 — Wavetable Voice
+- [ ] Single-cycle WAV files into wavetable
+- [ ] Morph position param; anti-aliased bandlimited playback
 
-#### 2.5 — Onset Threshold UI
-- [ ] Onset sensitivity slider already implemented; ensure value persists in AudioParameter
-- [ ] Visual feedback: onset count updates live as threshold dragged
+---
 
-### Phase 3 — Preset Snapshot System (partial ✓)
+### Phase 4 — Preset Snapshot System (partial ✓)
 
-- [x] 8 FX preset slots per voice (save/recall, displayed in voice tab)
+- [x] 8 FX preset slots per voice (save/recall)
 - [ ] Save/load presets to file (persisted across sessions)
-- [ ] Auto-fill from random (ring buffer of last N random states)
 - [ ] Preset sequence lane (which preset fires on which step)
-- [ ] Randomize as sequencer event layer with chance/probability
+- [ ] Randomize as sequencer event layer with probability
 
-### Phase 4 — ONNX + ML Analysis
+---
+
+### Phase 5 — ONNX + ML Analysis
 
 - [ ] ONNX Runtime via CMake FetchContent
-- [ ] Instrument classification model (kick/snare/hat/melodic)
-- [ ] Better BPM detection (replace autocorrelation with ML model)
-- [ ] Source separation (advanced)
+- [ ] Instrument classification (kick/snare/hat/melodic) — complement FluCoMa clusters
+- [ ] Source separation (harmonic/percussive split, feed each to separate voice)
 
-### Phase 5 — UI Upgrade
+---
+
+### Phase 6 — UI Upgrade
 
 - [ ] WebView frontend (CHOC library)
 - [ ] HTML/CSS/JS UI with C++ DSP backend
-- [ ] Gaborator spectrogram library (mentioned by user) for waveform view
+- [ ] Gaborator spectrogram for waveform view
 
-### Phase 6 — Release
+---
 
-- [ ] Code signing + notarisation (macOS distribution requirement)
+### Phase 7 — Release
+
+- [ ] Code signing + notarisation (macOS)
 - [ ] Windows build (CMake + MSVC or Clang-cl)
 - [ ] Installer packaging
