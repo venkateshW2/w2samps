@@ -1456,8 +1456,8 @@ private:
         juce::Label      stepsLabel { "", "Steps" };
         juce::Label      hitsLabel  { "", "Hits" };
         juce::Label      rotLabel   { "", "Rot" };
-        juce::TextButton smpAdvBtn  { "Hold" };
-        juce::TextButton loopModeBtn { "Off" };
+        juce::TextButton smpAdvBtn   { "Hold" };
+        juce::ComboBox   loopModeCombo;
         juce::Slider     loopMsSlider;
         juce::Label      loopMsLabel { "", "Loop ms" };
         juce::TextButton loopLockBtn { "Lock" };

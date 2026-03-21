@@ -606,22 +606,28 @@ public:
         levelSlider.onValueChange = [this] { proc_.setPreviewLevel ((float)levelSlider.getValue()); };
         playBtn.onClick = [this]
         {
-            // If buffer already decoded, play it immediately
+            // If buffer already decoded for the current selection, play immediately
             if (previewBufPtr_ && previewBufPtr_->getNumSamples() > 0)
             {
                 proc_.startPreview (previewBufPtr_, previewSampleRate_);
                 return;
             }
 
-            // Resolve the file to preview regardless of whether it's in the DB
+            // Resolve file — works for Browse (even without DB entry) and Playlist
             juce::File f = resolveSelectedFile();
-            if (!f.existsAsFile()) return;
+            if (!f.existsAsFile())
+            {
+                statusLabel.setText ("No file selected", juce::dontSendNotification);
+                return;
+            }
 
-            juce::File capFile = f;
-            worker_.addPreviewJob (f, [this, capFile]
+            int gen = ++previewGeneration_;
+            statusLabel.setText ("Loading preview\xe2\x80\xa6", juce::dontSendNotification);
+
+            worker_.addPreviewJob (f, [this, gen]
                 (std::shared_ptr<juce::AudioBuffer<float>> buf, double sr)
             {
-                if (!buf || capFile != resolveSelectedFile()) return;
+                if (gen != previewGeneration_ || !buf) return;
                 previewBufPtr_     = buf;
                 previewSampleRate_ = sr;
                 proc_.startPreview (buf, sr);
@@ -871,6 +877,8 @@ public:
         if (leftMode_ == LeftMode::Playlist)
         {
             selectedPlaylistRow_ = lastRow;
+            previewBufPtr_ = nullptr;
+            ++previewGeneration_;
             // Load the file from the playlist for preview / waveform
             SampleEntry e;
             if (currentPlaylist_.getEntry (lastRow, e))
@@ -908,6 +916,8 @@ public:
             juce::File f = currentDir_.getChildFile (info.filename);
             selectedFileIdx_    = -1;  // reset DB index
             selectedBrowseFile_ = f;   // always track the actual file
+            previewBufPtr_      = nullptr;
+            ++previewGeneration_;
 
             // Check if in SampleDatabase
             const SampleEntry* dbEntry = SampleDatabase::instance().getEntry (f);
@@ -1181,6 +1191,7 @@ private:
     int        selectedFileIdx_    = -1;
     juce::File selectedBrowseFile_;               // set in Browse mode even if not in DB
     int  waveLoadGeneration_ = 0;  // incremented per load; lets stale callbacks self-cancel
+    int  previewGeneration_  = 0;  // incremented on each new Play press; stale-cancel guard
     bool waveLoading_        = false;
     int  lastEntryCount_     = -1;   // avoids redundant corpus repaints in timer
 

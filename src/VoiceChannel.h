@@ -363,7 +363,10 @@ public:
                                 }
                             }
                         }
-                        ++hitCount_; // advance hit counter AFTER reading the mapper
+                        // Advance hit counter and wrap at seqHits so grid columns
+                        // repeat each pattern cycle (col 0 = hit 0 every cycle).
+                        ++hitCount_;
+                        if (modSeqHits > 0) hitCount_ = hitCount_ % modSeqHits;
 
                         if (!found)
                         {

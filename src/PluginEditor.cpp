@@ -324,12 +324,20 @@ void W2SamplerEditor::buildVoiceUI (int v)
     };
     leftContent_.addAndMakeVisible (ui.freezeBtn);
 
-    styleButton (ui.loopModeBtn);
-    ui.loopModeBtn.onClick = [this,v] {
-        *proc.vp[v].loopMode = (proc.vp[v].loopMode->get() + 1) % 6;
-        updateCycleBtns (v);
+    ui.loopModeCombo.addItem ("Off",      1);
+    ui.loopModeCombo.addItem ("Fixed",    2);
+    ui.loopModeCombo.addItem ("Rnd",      3);
+    ui.loopModeCombo.addItem ("Seq",      4);
+    ui.loopModeCombo.addItem ("OnsetSeq", 5);
+    ui.loopModeCombo.addItem ("OnsetRnd", 6);
+    ui.loopModeCombo.setSelectedId (proc.vp[v].loopMode->get() + 1, juce::dontSendNotification);
+    ui.loopModeCombo.setColour (juce::ComboBox::backgroundColourId, juce::Colour (kElevated));
+    ui.loopModeCombo.setColour (juce::ComboBox::textColourId,       juce::Colour (kText));
+    ui.loopModeCombo.setColour (juce::ComboBox::outlineColourId,    juce::Colour (kPanel));
+    ui.loopModeCombo.onChange = [this,v] {
+        *proc.vp[v].loopMode = voiceUI[v].loopModeCombo.getSelectedId() - 1;
     };
-    leftContent_.addAndMakeVisible (ui.loopModeBtn);
+    leftContent_.addAndMakeVisible (ui.loopModeCombo);
 
     styleButton (ui.loopLockBtn);
     ui.loopLockBtn.setClickingTogglesState (true);
@@ -835,7 +843,7 @@ void W2SamplerEditor::hideVoiceAll()
         hide (ui.hitsSlider);   hide (ui.hitsLabel);
         hide (ui.rotSlider);    hide (ui.rotLabel);
         hide (ui.smpAdvBtn);
-        hide (ui.loopModeBtn); hide (ui.loopMsSlider); hide (ui.loopMsLabel);
+        hide (ui.loopModeCombo); hide (ui.loopMsSlider); hide (ui.loopMsLabel);
         hide (ui.loopLockBtn); hide (ui.freezeBtn);
 
         hide (ui.offsetSlider); hide (ui.offsetLabel);
@@ -975,8 +983,8 @@ void W2SamplerEditor::layoutVoicePanel (int v)
         // SmpAdv + LoopMode buttons side by side (each half width)
         {
             int hw = cw / 2 - 2;
-            ui.smpAdvBtn.setBounds   (x0,          y, hw, rh - 2); ui.smpAdvBtn.setVisible (true);
-            ui.loopModeBtn.setBounds (x0 + hw + 4, y, cw - hw - 4, rh - 2); ui.loopModeBtn.setVisible (true);
+            ui.smpAdvBtn    .setBounds (x0,          y, hw,           rh - 2); ui.smpAdvBtn.setVisible (true);
+            ui.loopModeCombo.setBounds (x0 + hw + 4, y, cw - hw - 4, rh - 2); ui.loopModeCombo.setVisible (true);
             y += rh + 2;
         }
 
@@ -1831,13 +1839,10 @@ void W2SamplerEditor::updateCycleBtns (int v)
 
     ui.phaseSrcBtn.setButtonText  (srcNames  [p.phaseSource->get()]);
     ui.smpAdvBtn.setButtonText    (advModes  [p.sampleAdv->get()]);
-    ui.loopModeBtn.setButtonText  (loopModes [p.loopMode->get()]);
+    ui.loopModeCombo.setSelectedId (p.loopMode->get() + 1, juce::dontSendNotification);
     ui.revBtn.setButtonText       (p.reverse->get() ? "Rev: ON" : "Rev: Off");
     ui.revBtn.setColour (juce::TextButton::buttonColourId,
         juce::Colour (p.reverse->get() ? (uint32_t)kActive : (uint32_t)kElevated));
-    // LoopMode: any mode other than Off (0) → active color
-    ui.loopModeBtn.setColour (juce::TextButton::buttonColourId,
-        juce::Colour (p.loopMode->get() != 0 ? (uint32_t)kActive : (uint32_t)kElevated));
     // SmpAdv: any mode other than Hold (0) → active color
     ui.smpAdvBtn.setColour (juce::TextButton::buttonColourId,
         juce::Colour (p.sampleAdv->get() != 0 ? (uint32_t)kActive : (uint32_t)kElevated));
