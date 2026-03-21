@@ -136,6 +136,44 @@ void W2SamplerProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     juce::ScopedNoDenormals noDenormals;
     buffer.clear();
 
+    // ── Preview audio (SoundBrowser) — runs regardless of transport state ─────
+    // Must be BEFORE the isPlaying_ gate so preview works while transport is stopped.
+    {
+        int pos = previewPos_.load (std::memory_order_acquire);
+        if (pos >= 0)
+        {
+            std::shared_ptr<juce::AudioBuffer<float>> localBuf;
+            {
+                const juce::ScopedTryLock stl (previewLock_);
+                if (stl.isLocked()) localBuf = previewBufPtr_;
+            }
+            if (localBuf && localBuf->getNumSamples() > 0)
+            {
+                float  level  = previewLevel_.load (std::memory_order_relaxed);
+                int    srcN   = localBuf->getNumSamples();
+                int    srcCh  = localBuf->getNumChannels();
+                int    outCh  = buffer.getNumChannels();
+                double ratio  = (previewSrcRate_ > 0.0) ? previewSrcRate_ / sampleRate_ : 1.0;
+                double fpos   = (double)pos;
+                bool   done   = false;
+                int    numSmp = buffer.getNumSamples();
+                for (int s = 0; s < numSmp; ++s)
+                {
+                    int ipos = (int)fpos;
+                    if (ipos >= srcN) { done = true; break; }
+                    float smp = 0.f;
+                    for (int c = 0; c < srcCh; ++c)
+                        smp += localBuf->getSample (c, ipos);
+                    smp = (smp / (float)srcCh) * level;
+                    for (int ch = 0; ch < outCh; ++ch)
+                        buffer.addSample (ch, s, smp);
+                    fpos += ratio;
+                }
+                previewPos_.store (done ? -1 : (int)fpos, std::memory_order_relaxed);
+            }
+        }
+    }
+
     if (!isPlaying_.load()) { midi.clear(); return; }
 
     clock_.setBPM (bpm ? (double) bpm->get() : 120.0);
@@ -144,6 +182,9 @@ void W2SamplerProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     int numSamples = buffer.getNumSamples();
     double masterPhase = clock_.phaseAfter (numSamples);
     clock_.phase = masterPhase;
+
+    // Expose clock phase to UI thread
+    clockPhaseUI_.store ((float) masterPhase, std::memory_order_relaxed);
 
     // Determine effective mute per voice (mute overrides solo; solo mutes others)
     int  solo     = soloVoice_.load();
@@ -195,6 +236,26 @@ void W2SamplerProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     float mg = masterGain ? masterGain->get() : 0.7f;
     if (std::abs (mg - 1.0f) > 0.001f)
         buffer.applyGain (mg);
+
+    // Synthesise tap-tempo click blip (~880 Hz, 5ms, half-sine envelope)
+    if (pendingClick_.exchange (false, std::memory_order_relaxed))
+        clickSamplesLeft_ = (int) (sampleRate_ * 0.005);  // 5 ms
+
+    if (clickSamplesLeft_ > 0)
+    {
+        const int totalClick = (int) (sampleRate_ * 0.005);
+        const double freq = 880.0;
+        int nCh = buffer.getNumChannels();
+        for (int s = 0; s < numSamples && clickSamplesLeft_ > 0; ++s, --clickSamplesLeft_)
+        {
+            int pos   = totalClick - clickSamplesLeft_;
+            float env = std::sin ((float) pos / (float) totalClick * juce::MathConstants<float>::pi);
+            float smp = env * 0.25f * std::sin (2.0f * juce::MathConstants<float>::pi
+                                                 * (float) freq * (float) pos / (float) sampleRate_);
+            for (int ch = 0; ch < nCh; ++ch)
+                buffer.addSample (ch, s, smp);
+        }
+    }
 
     // Track output peaks (fast attack, UI reads these for meter)
     float pL = 0.0f, pR = 0.0f;
@@ -305,6 +366,24 @@ void W2SamplerProcessor::fillVoiceParams (int v, VoiceChannel::Params& out) cons
 }
 
 //==============================================================================
+// Preview playback
+//==============================================================================
+void W2SamplerProcessor::startPreview (std::shared_ptr<juce::AudioBuffer<float>> buf, double srcRate)
+{
+    // No buffer copy at all — we just share ownership of the same allocation.
+    // Lock held only for the shared_ptr assignment (ref-count bump, ~ns).
+    previewPos_.store (-1, std::memory_order_release);
+    {
+        const juce::ScopedLock lock (previewLock_);
+        previewBufPtr_  = std::move (buf);
+        previewSrcRate_ = srcRate;
+        previewLen_.store (previewBufPtr_ ? previewBufPtr_->getNumSamples() : 0,
+                           std::memory_order_relaxed);
+    }
+    previewPos_.store (0, std::memory_order_release);
+}
+
+//==============================================================================
 // Message-thread API
 //==============================================================================
 void W2SamplerProcessor::loadFolder (int v, const juce::File& folder)
@@ -314,6 +393,16 @@ void W2SamplerProcessor::loadFolder (int v, const juce::File& folder)
     voices_[v].getLibrary().analyseAllOnsets (0.5f);
 
     // Reset region to full buffer, loop to first 25% — makes handles visually distinct
+    auto& p = vp[v];
+    *p.regionStart = 0.0f;  *p.regionEnd = 1.0f;
+    *p.loopStart   = 0.0f;  *p.loopEnd   = 0.25f;
+}
+
+void W2SamplerProcessor::loadSingleFile (int v, const juce::File& file)
+{
+    if (v < 0 || v > 2) return;
+    voices_[v].loadSingleFile (file, formatManager_);
+    voices_[v].getLibrary().analyseOnsets (0, 0.5f);
     auto& p = vp[v];
     *p.regionStart = 0.0f;  *p.regionEnd = 1.0f;
     *p.loopStart   = 0.0f;  *p.loopEnd   = 0.25f;

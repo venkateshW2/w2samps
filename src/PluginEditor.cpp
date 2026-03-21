@@ -114,35 +114,45 @@ void W2SamplerEditor::buildTransportBar()
     bpmLabel.setText ("BPM", juce::dontSendNotification);
     addAndMakeVisible (bpmLabel);
 
-    // BPM as drag-number display (vertical drag = natural; double-click to type)
-    styleSlider (bpmSlider, 20.0f, 999.0f, proc.bpm->get());
-    bpmSlider.setName ("bpm_drag");
-    bpmSlider.setSliderStyle (juce::Slider::LinearVertical);
-    bpmSlider.setTextBoxStyle (juce::Slider::NoTextBox, true, 0, 0);
-    bpmSlider.setPopupDisplayEnabled (true, true, this);
-    bpmSlider.setDoubleClickReturnValue (false, 0.0); // disable reset; double-click opens text entry
-    bpmSlider.setVelocityBasedMode (true);
-    bpmSlider.setVelocityModeParameters (1.5, 1, 0.05);
-    bpmSlider.onValueChange = [this] { *proc.bpm = (float)bpmSlider.getValue(); };
-    // Double-click to type BPM value
-    struct BpmTyper : public juce::MouseListener {
-        juce::Slider& sl; W2SamplerProcessor& proc;
-        BpmTyper (juce::Slider& s, W2SamplerProcessor& p) : sl(s), proc(p) {}
-        void mouseDoubleClick (const juce::MouseEvent&) override {
-            auto dlg = std::make_shared<juce::AlertWindow> ("BPM", "Enter BPM (20–999):", juce::MessageBoxIconType::NoIcon);
-            dlg->addTextEditor ("bpm", juce::String ((int)sl.getValue()), "");
-            dlg->addButton ("OK",     1, juce::KeyPress (juce::KeyPress::returnKey));
-            dlg->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
-            dlg->enterModalState (true, juce::ModalCallbackFunction::create ([this, dlg] (int r) {
-                if (r == 1) {
-                    double v = std::clamp (dlg->getTextEditorContents("bpm").getDoubleValue(), 20.0, 999.0);
-                    sl.setValue (v, juce::sendNotificationAsync);
-                }
-            }), false);
+    // BPM display — click once to edit inline
+    bpmDisplay.setFont (juce::Font (juce::FontOptions{}.withHeight (16.0f).withStyle ("Bold")));
+    bpmDisplay.setJustificationType (juce::Justification::centred);
+    bpmDisplay.setColour (juce::Label::textColourId,        juce::Colour (kText));
+    bpmDisplay.setColour (juce::Label::backgroundColourId,  juce::Colour (kElevated));
+    bpmDisplay.setColour (juce::Label::outlineColourId,     juce::Colour (kAccent));
+    bpmDisplay.setColour (juce::Label::textWhenEditingColourId,       juce::Colour (kText));
+    bpmDisplay.setColour (juce::Label::backgroundWhenEditingColourId, juce::Colour (kPanel));
+    bpmDisplay.setText (juce::String ((int)(proc.bpm ? proc.bpm->get() : 120.f)), juce::dontSendNotification);
+    bpmDisplay.setEditable (false, true, false);   // single-click = no, double-click = yes
+    bpmDisplay.onTextChange = [this] {
+        double v = std::clamp (bpmDisplay.getText().getDoubleValue(), 20.0, 999.0);
+        if (proc.bpm) *proc.bpm = (float) v;
+        bpmDisplay.setText (juce::String ((int) v), juce::dontSendNotification);
+    };
+    addAndMakeVisible (bpmDisplay);
+
+    // TAP button — sets BPM from inter-tap intervals
+    styleButton (tapBtn);
+    tapBtn.onClick = [this] {
+        proc.requestClick();  // audible click
+        juce::int64 now = juce::Time::currentTimeMillis();
+        // Reset if gap > 3 seconds
+        if (tapCount_ > 0 && now - tapTimes_[(tapCount_ - 1) % 4] > 3000)
+            tapCount_ = 0;
+        tapTimes_[tapCount_ % 4] = now;
+        ++tapCount_;
+        if (tapCount_ >= 2)
+        {
+            int n = std::min (tapCount_, 4);
+            juce::int64 first = tapTimes_[(tapCount_ - n) % 4];
+            juce::int64 last  = tapTimes_[(tapCount_ - 1) % 4];
+            double avgMs = (double)(last - first) / (double)(n - 1);
+            double bpmVal = std::clamp (60000.0 / avgMs, 20.0, 999.0);
+            if (proc.bpm) *proc.bpm = (float) bpmVal;
+            bpmDisplay.setText (juce::String ((int) bpmVal), juce::dontSendNotification);
         }
     };
-    bpmSlider.addMouseListener (new BpmTyper (bpmSlider, proc), false);
-    addAndMakeVisible (bpmSlider);
+    addAndMakeVisible (tapBtn);
 
     const char* divNames[] = { "1 Beat", "2 Beats", "4=Bar", "8=2Bar" };
     for (int i = 0; i < kNumClkDivs; ++i)
@@ -158,6 +168,15 @@ void W2SamplerEditor::buildTransportBar()
         };
         addAndMakeVisible (clkDivBtns[i]);
     }
+
+    // Browse button — opens Sound Browser window
+    styleButton (browseBtn);
+    browseBtn.onClick = [this] {
+        if (soundBrowser_ == nullptr)
+            soundBrowser_ = std::make_unique<SoundBrowser> (proc);
+        soundBrowser_->openOrFocus();
+    };
+    addAndMakeVisible (browseBtn);
 
     // Timeline toggle button
     styleButton (tlToggleBtn);
@@ -726,7 +745,10 @@ void W2SamplerEditor::layoutTransportBar()
     playBtn.setBounds (x, y + 5, 56, h - 10); x += 62;
 
     bpmLabel.setBounds (x, y + 10, 28, 18); x += 30;
-    bpmSlider.setBounds (x, y + 4, 80, h - 8); x += 86;
+    bpmDisplay.setBounds (x, y + 5, 72, h - 10); x += 76;
+    tapBtn.setBounds (x, y + 5, 36, h - 10); x += 42;
+    // Beat indicator dot area — reserved 14px after TAP button (drawn in paint())
+    x += 14;
 
     // 4 clkDiv buttons — fill remaining space before right column
     int divAreaW = W - x - kRightW - 8;
@@ -739,8 +761,9 @@ void W2SamplerEditor::layoutTransportBar()
                                  juce::Colour (active ? kActive : kElevated));
     }
 
-    // TL button — rightmost before master column
-    tlToggleBtn.setBounds (x + 4, y + 5, 32, h - 10);
+    // Browse + TL buttons — rightmost before master column
+    browseBtn  .setBounds (x + 2,  y + 5, 54, h - 10);
+    tlToggleBtn.setBounds (x + 60, y + 5, 32, h - 10);
 
     // Mute/Solo hidden from transport — they live in the master column
     for (int v = 0; v < 3; ++v)
@@ -1190,6 +1213,22 @@ void W2SamplerEditor::paint (juce::Graphics& g)
     g.setColour (juce::Colour (kAccent));
     g.drawHorizontalLine (kTransportH, 0.0f, (float)W);
 
+    // Beat indicator dot — positioned after TAP button
+    // Layout: play(4+56+6=66) + bpmLbl(28+30=58) + bpmDisp(72+76=148) + tap(36+42=78) = x=204, dot at 211
+    {
+        const int dotX = 211, dotY = kTransportH / 2, dotR = 5;
+        if (beatFlash_ && proc.getPlaying())
+        {
+            g.setColour (juce::Colour (kActive));
+            g.fillEllipse ((float)(dotX - dotR), (float)(dotY - dotR), (float)(dotR * 2), (float)(dotR * 2));
+        }
+        else
+        {
+            g.setColour (juce::Colour (kElevated));
+            g.drawEllipse ((float)(dotX - dotR), (float)(dotY - dotR), (float)(dotR * 2), (float)(dotR * 2), 1.0f);
+        }
+    }
+
     // Left column background (voice selector row + viewport area)
     g.setColour (juce::Colour (kPanel));
     g.fillRect (0, mainY, kLeftW, mainH);
@@ -1514,9 +1553,24 @@ void W2SamplerEditor::timerCallback()
     if (!masterColumnRect_.isEmpty())
         repaint (masterColumnRect_);
 
-    // Sync BPM
-    if (proc.bpm)
-        bpmSlider.setValue ((double)proc.bpm->get(), juce::dontSendNotification);
+    // Sync BPM display (only update when not editing)
+    if (proc.bpm && !bpmDisplay.isBeingEdited())
+        bpmDisplay.setText (juce::String ((int) proc.bpm->get()), juce::dontSendNotification);
+
+    // Beat indicator — detect phase wrap (phase went backwards → new beat)
+    {
+        float cp = proc.getClockPhase();
+        if (proc.getPlaying() && cp < prevClockPhase_)
+        {
+            beatFlash_   = true;
+            beatFlashMs_ = juce::Time::currentTimeMillis();
+        }
+        prevClockPhase_ = cp;
+        if (beatFlash_ && juce::Time::currentTimeMillis() - beatFlashMs_ > 80)
+            beatFlash_ = false;
+        // Repaint transport bar dot area
+        repaint (0, 0, getWidth(), kTransportH);
+    }
 
     playBtn.setButtonText (proc.getPlaying() ? "Stop" : "Play");
     playBtn.setColour (juce::TextButton::buttonColourId,

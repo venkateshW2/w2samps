@@ -1,0 +1,1294 @@
+#pragma once
+/**
+ * SoundBrowser — detachable sound analysis + slice corpus browser.
+ *
+ * Architecture:
+ *   • File list  : one row per file, immediate on add (unanalysed OK)
+ *   • Waveform   : full-height onset lines, playhead, highlighted slice region
+ *   • Analysis   : detected key + metadata key side-by-side, BPM, pitch, MFCC
+ *   • Settings   : window / hop / MFCC count / onset threshold controls
+ *   • Corpus     : UMAP 2D scatter of onset SLICES (not whole files)
+ *   • Background : AnalysisWorker thread processes file queue; auto-rebuilds
+ */
+
+#include <juce_gui_basics/juce_gui_basics.h>
+#include <juce_audio_basics/juce_audio_basics.h>
+#include <juce_audio_formats/juce_audio_formats.h>
+#include "SampleDatabase.h"
+#include "PluginProcessor.h"
+
+#if defined (__APPLE__)
+#include <pthread.h>
+#endif
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pre-computed waveform thumbnail — 1024 min/max pairs built on worker thread.
+// Paint uses this O(width) lookup instead of scanning millions of raw samples.
+// ─────────────────────────────────────────────────────────────────────────────
+struct WaveThumb
+{
+    static constexpr int kSize = 1024;
+    struct Pt { float lo = 0.f, hi = 0.f; };
+    std::vector<Pt> pts;   // kSize entries, built by worker thread
+
+    /** Build thumbnail with a single sequential pass — 4096-sample working buffer,
+     *  no large allocation regardless of file length. Safe from background thread. */
+    static WaveThumb buildFromReader (juce::AudioFormatReader& rdr)
+    {
+        WaveThumb t;
+        const int64_t len = rdr.lengthInSamples;
+        const int     ch  = (int)rdr.numChannels;
+        if (len == 0 || ch == 0) return t;
+        t.pts.resize (kSize, { 0.f, 0.f });
+
+        const int chunkSz = 4096;
+        juce::AudioBuffer<float> work (ch, chunkSz);
+        int64_t pos = 0;
+        while (pos < len)
+        {
+            int n = (int)std::min ((int64_t)chunkSz, len - pos);
+            work.clear();
+            rdr.read (&work, 0, n, pos, true, true);
+            for (int s = 0; s < n; ++s)
+            {
+                int px = (int)((pos + (int64_t)s) * (int64_t)kSize / len);
+                px = juce::jlimit (0, kSize - 1, px);
+                for (int c = 0; c < ch; ++c)
+                {
+                    float v = work.getSample (c, s);
+                    if (v > t.pts[(size_t)px].hi) t.pts[(size_t)px].hi = v;
+                    if (v < t.pts[(size_t)px].lo) t.pts[(size_t)px].lo = v;
+                }
+            }
+            pos += n;
+        }
+        return t;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Background analysis worker
+//
+// Threading contract:
+//   - Background thread ONLY: file I/O, FluCoMa analysis, JSON read/write.
+//     All work is on local variables — no shared SampleDatabase state touched.
+//   - Results are marshaled to the message thread via callAsync.
+//   - storeEntry() / applyCorpusResults() run on message thread inside callAsync.
+// ─────────────────────────────────────────────────────────────────────────────
+class AnalysisWorker : public juce::Thread
+{
+public:
+    enum class JobType { AnalyseFile, BuildCorpus, LoadWaveform, LoadPreview, CheckCache };
+    struct Job
+    {
+        JobType    type;
+        juce::File file;
+        float      sensitivity     = 0.5f;
+        bool       forceReanalysis = false;
+        AnalysisSettings settings;   // copied at queue time; bg thread never reads settings_
+        // LoadWaveform: thumbnail only, buf arg is always nullptr (no large allocation)
+        std::function<void(std::shared_ptr<juce::AudioBuffer<float>>, double, WaveThumb)> waveCallback;
+        // LoadPreview: fires with decoded buffer (30s max) when user presses Play
+        std::function<void(std::shared_ptr<juce::AudioBuffer<float>>, double)> previewCallback;
+        // BuildCorpus: descriptor + hash snapshot captured on message thread
+        std::vector<std::array<float, 50>> descriptors;
+        std::vector<juce::String>          hashes;
+    };
+
+    std::function<void()> onProgress;   // called on message thread after each step
+
+    AnalysisWorker() : juce::Thread ("W2AnalysisWorker")
+    {
+        // Register codecs here (message thread) — CoreAudio codec init from a
+        // background thread on macOS is expensive and contends with the run loop.
+        fmtMgr_.registerBasicFormats();
+        startThread (juce::Thread::Priority::background);
+    }
+    ~AnalysisWorker() override { stopThread (5000); }
+
+    void addFileJob (juce::File f, float sens, bool forceReanalysis = false)
+    {
+        Job j;
+        j.type            = JobType::AnalyseFile;
+        j.file            = std::move (f);
+        j.sensitivity     = sens;
+        j.forceReanalysis = forceReanalysis;
+        j.settings        = SampleDatabase::instance().getSettings();  // copy on msg thread
+        const juce::ScopedLock lock (queueLock_);
+        queue_.push_back (std::move (j));
+        notify();
+    }
+
+    /** Read-only cache lookup — no audio I/O, no FluCoMa. Fast.
+     *  If JSON cache hit: marshals SampleEntry to message thread via callAsync.
+     *  If miss: does nothing (file stays valid=false until user clicks Analyse). */
+    void addCheckCacheJob (juce::File f)
+    {
+        Job j;
+        j.type = JobType::CheckCache;
+        j.file = std::move (f);
+        const juce::ScopedLock lock (queueLock_);
+        queue_.push_back (std::move (j));
+        notify();
+    }
+
+    /** Build waveform thumbnail from file (sequential read, no large alloc).
+     *  Callback fires on message thread with buf=nullptr and the WaveThumb. */
+    void addWaveformJob (juce::File f,
+                         std::function<void(std::shared_ptr<juce::AudioBuffer<float>>, double, WaveThumb)> cb)
+    {
+        Job j;
+        j.type         = JobType::LoadWaveform;
+        j.file         = std::move (f);
+        j.waveCallback = std::move (cb);
+        const juce::ScopedLock lock (queueLock_);
+        queue_.insert (queue_.begin(), std::move (j));  // front — show waveform first
+        notify();
+    }
+
+    /** Load up to 30s of audio for preview playback. Inserts at front of queue.
+     *  Callback fires on message thread with the decoded buffer. */
+    void addPreviewJob (juce::File f,
+                        std::function<void(std::shared_ptr<juce::AudioBuffer<float>>, double)> cb)
+    {
+        Job j;
+        j.type            = JobType::LoadPreview;
+        j.file            = std::move (f);
+        j.previewCallback = std::move (cb);
+        const juce::ScopedLock lock (queueLock_);
+        queue_.insert (queue_.begin(), std::move (j));  // front — play ASAP
+        notify();
+    }
+
+    /** Snapshot descriptors from message thread, queue KMeans+UMAP job.
+     *  Must be called from message thread (reads entries_). */
+    void queueRebuildCorpus()
+    {
+        const auto& entries = SampleDatabase::instance().getEntries();
+        Job j;
+        j.type = JobType::BuildCorpus;
+        for (const auto& e : entries)
+            if (e.valid) { j.descriptors.push_back (e.descriptor); j.hashes.push_back (e.hash); }
+        if (j.descriptors.empty()) return;
+        const juce::ScopedLock lock (queueLock_);
+        queue_.push_back (std::move (j));
+        notify();
+    }
+
+    bool isBusy()       const { return busy_.load(); }
+    int  pendingCount() const
+    {
+        const juce::ScopedLock lock (queueLock_);
+        return (int)queue_.size() + (busy_.load() ? 1 : 0);
+    }
+
+    void run() override
+    {
+       #if defined (__APPLE__)
+        // UTILITY: gets more CPU than BACKGROUND while still never competing with
+        // the real-time CoreAudio thread (which runs at THREAD_TIME_CONSTRAINT_POLICY).
+        pthread_set_qos_class_self_np (QOS_CLASS_UTILITY, 0);
+       #endif
+
+        while (!threadShouldExit())
+        {
+            Job job;
+            bool hasJob = false;
+            {
+                const juce::ScopedLock lock (queueLock_);
+                if (!queue_.empty())
+                {
+                    job = std::move (queue_.front());
+                    queue_.erase (queue_.begin());
+                    hasJob = true;
+                }
+            }
+            // Wait OUTSIDE the lock — message thread must never block on queueLock_
+            if (!hasJob) { wait (200); continue; }
+
+            busy_.store (true);
+
+            // ── Analyse file ──────────────────────────────────────────────────
+            if (job.type == JobType::AnalyseFile && job.file.existsAsFile())
+            {
+                // 1. Try JSON cache — pure file read, no shared state
+                SampleEntry cached;
+                if (!job.forceReanalysis && SampleDatabase::loadCacheEntry (job.file, cached))
+                {
+                    juce::MessageManager::callAsync (
+                        [this, e = std::move (cached)]() mutable
+                        {
+                            SampleDatabase::instance().storeEntry (std::move (e));
+                            if (onProgress) onProgress();
+                        });
+                    busy_.store (false);
+                    continue;
+                }
+
+                // 2. Read audio
+                auto reader = std::unique_ptr<juce::AudioFormatReader> (
+                    fmtMgr_.createReaderFor (job.file));
+                if (!reader)
+                {
+                    juce::MessageManager::callAsync ([this] { if (onProgress) onProgress(); });
+                    busy_.store (false);
+                    continue;
+                }
+
+                int64_t nSmp = reader->lengthInSamples;
+                juce::AudioBuffer<float> buf ((int)reader->numChannels, (int)nSmp);
+                reader->read (&buf, 0, (int)nSmp, 0, true, true);
+                double sr = reader->sampleRate;
+
+                // 3. Read metadata tags
+                const auto& meta = reader->metadataValues;
+                juce::String metaKey;
+                for (const char* k : { "TKEY","initialkey","key","Key","IKEY","KeyWords" })
+                {
+                    juce::String v = meta.getValue (k, "");
+                    if (v.isNotEmpty()) { metaKey = SampleDatabase::parseMetaKey (v); break; }
+                }
+                juce::String metaBpmStr = SampleDatabase::parseMetaBpm (meta);
+
+                // 4. Run FluCoMa — CPU intensive, all local
+                FluCoMaAnalyser fa;
+                fa.windowSize     = job.settings.windowSize;
+                fa.fftSize        = job.settings.windowSize;
+                fa.hopSize        = job.settings.hopSize;
+                fa.nMfccCoeff     = job.settings.mfccCoeff;
+                fa.onsetThreshold = (double)(1.0f - job.sensitivity) * 0.5 + 0.05;
+                fa.onsetDebounce  = job.settings.onsetDebounce;
+                FluCoMaResult result = fa.analyse (buf, sr);
+
+                // 5. Build complete SampleEntry locally — no shared state
+                SampleEntry e;
+                e.file       = job.file;
+                e.hash       = SampleDatabase::fileKey (job.file);
+                e.analysedAt = juce::Time::getCurrentTime().toISO8601 (true);
+                e.duration   = (double)nSmp / sr;
+                e.tempo      = result.estimatedBpm;
+                e.key        = result.key;
+                e.keyConf    = result.keyConfidence;
+                e.keyName    = result.keyName;
+                e.metaKey    = metaKey;
+                e.metaBpm    = metaBpmStr.getFloatValue();
+                e.descriptor = result.descriptor;
+                e.analysis   = std::move (result);
+                e.valid      = true;
+
+                // 6. Write JSON cache — file I/O, no shared state
+                SampleDatabase::writeCacheEntry (e);
+
+                // 7. Marshal to message thread
+                juce::MessageManager::callAsync (
+                    [this, entry = std::move (e)]() mutable
+                    {
+                        SampleDatabase::instance().storeEntry (std::move (entry));
+                        if (onProgress) onProgress();
+                    });
+            }
+
+            // ── Cache-only lookup (no audio I/O, no analysis) ────────────────
+            // Runs quickly — just reads a small JSON file from ~/.w2sampler/cache/.
+            // Restores previously-analysed metadata for files added to the list.
+            else if (job.type == JobType::CheckCache && job.file.existsAsFile())
+            {
+                SampleEntry cached;
+                if (SampleDatabase::loadCacheEntry (job.file, cached))
+                {
+                    juce::MessageManager::callAsync (
+                        [this, e = std::move (cached)]() mutable
+                        {
+                            SampleDatabase::instance().storeEntry (std::move (e));
+                            if (onProgress) onProgress();
+                        });
+                }
+            }
+
+            // ── KMeans + UMAP corpus ──────────────────────────────────────────
+            else if (job.type == JobType::BuildCorpus && !job.descriptors.empty())
+            {
+                // Pure computation on snapshot — no shared state
+                auto pts    = SampleDatabase::computeCorpus (job.descriptors);
+                auto hashes = std::move (job.hashes);
+                juce::MessageManager::callAsync (
+                    [this, pts = std::move (pts), hashes = std::move (hashes)]() mutable
+                    {
+                        SampleDatabase::instance().applyCorpusResults (hashes, pts);
+                        if (onProgress) onProgress();
+                    });
+            }
+
+            // ── Load waveform thumbnail (no large allocation) ─────────────────
+            // Reads entire file sequentially with a 4096-sample working buffer.
+            // Never allocates a large AudioBuffer — no heap pressure, no malloc stalls.
+            else if (job.type == JobType::LoadWaveform
+                     && job.file.existsAsFile() && job.waveCallback)
+            {
+                auto reader = std::unique_ptr<juce::AudioFormatReader> (
+                    fmtMgr_.createReaderFor (job.file));
+                if (reader)
+                {
+                    double    sr    = reader->sampleRate;
+                    WaveThumb thumb = WaveThumb::buildFromReader (*reader);
+                    auto cb = job.waveCallback;
+                    // Pass nullptr for buf — preview loads separately on Play press
+                    juce::MessageManager::callAsync (
+                        [cb, sr, th = std::move (thumb)]() mutable
+                        { cb (nullptr, sr, std::move (th)); });
+                }
+            }
+
+            // ── Load preview buffer on demand (Play pressed) ──────────────────
+            // Reads at most 30s — manageable allocation, only when user asks to play.
+            else if (job.type == JobType::LoadPreview
+                     && job.file.existsAsFile() && job.previewCallback)
+            {
+                auto reader = std::unique_ptr<juce::AudioFormatReader> (
+                    fmtMgr_.createReaderFor (job.file));
+                if (reader)
+                {
+                    double  sr   = reader->sampleRate;
+                    int64_t nSmp = std::min (reader->lengthInSamples,
+                                             (int64_t)(sr * 30.0));   // 30s max
+                    auto buf = std::make_shared<juce::AudioBuffer<float>> (
+                        (int)reader->numChannels, (int)nSmp);
+                    reader->read (buf.get(), 0, (int)nSmp, 0, true, true);
+                    auto cb = job.previewCallback;
+                    juce::MessageManager::callAsync (
+                        [cb, buf, sr]() mutable { cb (buf, sr); });
+                }
+            }
+
+            busy_.store (false);
+        }
+    }
+
+private:
+    mutable juce::CriticalSection  queueLock_;
+    std::vector<Job>               queue_;
+    std::atomic<bool>              busy_ { false };
+    juce::AudioFormatManager       fmtMgr_;   // registered on message thread, read-only after
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CorpusView — UMAP 2D scatter of whole-file SampleEntry dots
+// ─────────────────────────────────────────────────────────────────────────────
+class CorpusView : public juce::Component
+{
+public:
+    std::function<void(int fileIdx)> onSelect;
+
+    void refresh (const std::vector<SampleEntry>& entries, int selected = -1)
+    {
+        entries_  = &entries;
+        selected_ = selected;
+        minX_ = minY_ =  1e9f;
+        maxX_ = maxY_ = -1e9f;
+        for (const auto& e : entries)
+        {
+            if (!e.valid || (e.umap2d[0] == 0.f && e.umap2d[1] == 0.f)) continue;
+            minX_ = std::min (minX_, e.umap2d[0]); maxX_ = std::max (maxX_, e.umap2d[0]);
+            minY_ = std::min (minY_, e.umap2d[1]); maxY_ = std::max (maxY_, e.umap2d[1]);
+        }
+        repaint();
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        auto b = getLocalBounds();
+        g.fillAll (juce::Colour (0xff151518));
+        g.setColour (juce::Colour (0xff2A2A2E)); g.drawRect (b, 1);
+
+        if (entries_ == nullptr || entries_->empty())
+        {
+            g.setColour (juce::Colour (0xff6E6E73)); g.setFont (11.f);
+            g.drawText ("No files — add files, Analyse, then Rebuild Corpus",
+                        b, juce::Justification::centred);
+            return;
+        }
+
+        bool hasUmap = false;
+        for (const auto& e : *entries_)
+            if (e.valid && (e.umap2d[0] != 0.f || e.umap2d[1] != 0.f))
+                { hasUmap = true; break; }
+
+        if (!hasUmap)
+        {
+            g.setColour (juce::Colour (0xff6E6E73)); g.setFont (11.f);
+            g.drawText (juce::String ((int)entries_->size()) + " files — click Rebuild Corpus to layout",
+                        b, juce::Justification::centred);
+            return;
+        }
+
+        float rangeX = maxX_ - minX_; if (rangeX < 1e-6f) rangeX = 1.f;
+        float rangeY = maxY_ - minY_; if (rangeY < 1e-6f) rangeY = 1.f;
+        const float m = 10.f;
+        float w = (float)b.getWidth() - 2.f * m;
+        float h = (float)b.getHeight() - 2.f * m;
+
+        for (int i = 0; i < (int)entries_->size(); ++i)
+        {
+            const auto& e = (*entries_)[(size_t)i];
+            if (!e.valid || (e.umap2d[0] == 0.f && e.umap2d[1] == 0.f)) continue;
+            float nx = (e.umap2d[0] - minX_) / rangeX;
+            float ny = 1.f - (e.umap2d[1] - minY_) / rangeY;
+            float px = m + nx * w, py = m + ny * h;
+            float r  = (i == selected_) ? 7.f : 4.f;
+            int   ci = (e.cluster >= 0 && e.cluster < 8) ? e.cluster : 0;
+            g.setColour (juce::Colour (kClusterCols[ci]).withAlpha (i == selected_ ? 1.f : 0.7f));
+            g.fillEllipse (px - r, py - r, r * 2.f, r * 2.f);
+            if (i == selected_) { g.setColour (juce::Colours::white); g.drawEllipse (px-r,py-r,r*2.f,r*2.f,1.5f); }
+        }
+    }
+
+    void mouseDown (const juce::MouseEvent& ev) override
+    {
+        if (entries_ == nullptr) return;
+        auto  b = getLocalBounds();
+        float rangeX = maxX_ - minX_; if (rangeX < 1e-6f) rangeX = 1.f;
+        float rangeY = maxY_ - minY_; if (rangeY < 1e-6f) rangeY = 1.f;
+        const float m = 10.f;
+        float w = (float)b.getWidth() - 2.f * m;
+        float h = (float)b.getHeight() - 2.f * m;
+        int bestIdx = -1; float bestDist = 20.f;
+        for (int i = 0; i < (int)entries_->size(); ++i)
+        {
+            const auto& e = (*entries_)[(size_t)i];
+            if (!e.valid || (e.umap2d[0] == 0.f && e.umap2d[1] == 0.f)) continue;
+            float nx = (e.umap2d[0] - minX_) / rangeX;
+            float ny = 1.f - (e.umap2d[1] - minY_) / rangeY;
+            float d  = std::hypot ((float)ev.x - (m + nx * w), (float)ev.y - (m + ny * h));
+            if (d < bestDist) { bestDist = d; bestIdx = i; }
+        }
+        if (bestIdx >= 0) { selected_ = bestIdx; repaint(); if (onSelect) onSelect (bestIdx); }
+    }
+
+private:
+    const std::vector<SampleEntry>* entries_ = nullptr;
+    int   selected_ = -1;
+    float minX_ = 0.f, maxX_ = 1.f, minY_ = 0.f, maxY_ = 1.f;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Drag divider bar
+// ─────────────────────────────────────────────────────────────────────────────
+struct DragBar : juce::Component
+{
+    bool isVert_;  // true = left/right resize, false = up/down resize
+    std::function<void(int)> onDelta;
+    int lastScreen_ = 0;
+
+    explicit DragBar (bool isVert) : isVert_ (isVert) {}
+
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (juce::Colour (0xff242428));
+        g.setColour (juce::Colour (0xff3A3A3E));
+        if (isVert_) g.fillRect (getWidth()/2 - 1, 4, 2, getHeight() - 8);
+        else         g.fillRect (4, getHeight()/2 - 1, getWidth() - 8, 2);
+    }
+    void mouseEnter (const juce::MouseEvent&) override
+    {
+        setMouseCursor (isVert_ ? juce::MouseCursor::LeftRightResizeCursor
+                                : juce::MouseCursor::UpDownResizeCursor);
+    }
+    void mouseDown  (const juce::MouseEvent& e) override
+    {
+        lastScreen_ = isVert_ ? e.getScreenX() : e.getScreenY();
+    }
+    void mouseDrag  (const juce::MouseEvent& e) override
+    {
+        int cur = isVert_ ? e.getScreenX() : e.getScreenY();
+        if (onDelta) onDelta (cur - lastScreen_);
+        lastScreen_ = cur;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SoundBrowserContent
+// ─────────────────────────────────────────────────────────────────────────────
+class SoundBrowserContent : public juce::Component,
+                            public juce::ListBoxModel,
+                            private juce::Timer
+{
+public:
+    explicit SoundBrowserContent (W2SamplerProcessor& p) : proc_ (p)
+    {
+        // Toolbar
+        for (auto* b : { &addFileBtn, &addFolderBtn, &rebuildBtn, &removeBtn })
+            addAndMakeVisible (b);
+        addFileBtn  .onClick = [this] { pickFiles(); };
+        addFolderBtn.onClick = [this] { pickFolder(); };
+        rebuildBtn  .onClick = [this] { triggerRebuildCorpus(); };
+        removeBtn   .onClick = [this] { removeSelected(); };
+        removeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff3A1A1A));
+
+        // File list
+        addAndMakeVisible (fileList);
+        fileList.setModel (this);
+        fileList.setRowHeight (22);
+        fileList.setColour (juce::ListBox::backgroundColourId, juce::Colour (0xff1A1A1E));
+
+        // Waveform
+        addAndMakeVisible (waveComp);
+
+        // Playback controls
+        addAndMakeVisible (playBtn);
+        addAndMakeVisible (stopBtn);
+        addAndMakeVisible (levelSlider);
+        playBtn.setButtonText (juce::CharPointer_UTF8 ("\xe2\x96\xb6"));
+        stopBtn.setButtonText (juce::CharPointer_UTF8 ("\xe2\x96\xa0"));
+        levelSlider.setRange (0.0, 1.0, 0.01); levelSlider.setValue (0.7);
+        levelSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+        levelSlider.setTextBoxStyle (juce::Slider::NoTextBox, true, 0, 0);
+        levelSlider.setTooltip ("Preview level");
+        levelSlider.onValueChange = [this] { proc_.setPreviewLevel ((float)levelSlider.getValue()); };
+        playBtn.onClick = [this] {
+            if (selectedFileIdx_ < 0) return;
+            if (previewBufPtr_ && previewBufPtr_->getNumSamples() > 0)
+            {
+                // Buffer already loaded — start immediately
+                proc_.startPreview (previewBufPtr_, previewSampleRate_);
+                return;
+            }
+            // Not loaded yet — queue a 30s load, start preview when ready
+            auto& ents = SampleDatabase::instance().getEntries();
+            if (selectedFileIdx_ >= (int)ents.size()) return;
+            juce::File f      = ents[(size_t)selectedFileIdx_].file;
+            int        capIdx = selectedFileIdx_;
+            worker_.addPreviewJob (f, [this, capIdx]
+                                   (std::shared_ptr<juce::AudioBuffer<float>> buf, double sr)
+            {
+                if (capIdx != selectedFileIdx_ || !buf) return;
+                previewBufPtr_     = buf;
+                previewSampleRate_ = sr;
+                proc_.startPreview (buf, sr);
+            });
+        };
+        stopBtn.onClick = [this] { proc_.stopPreview(); };
+
+        // Analyse button + sensitivity slider
+        addAndMakeVisible (analyseBtn);
+        addAndMakeVisible (sensLabel);
+        addAndMakeVisible (sensSlider);
+        sensLabel.setText ("Sens:", juce::dontSendNotification);
+        sensLabel.setFont (juce::Font (juce::FontOptions{}.withHeight (11.f)));
+        sensLabel.setColour (juce::Label::textColourId, juce::Colour (0xff8E8E93));
+        sensSlider.setRange (0.0, 1.0, 0.01); sensSlider.setValue (0.5);
+        sensSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+        sensSlider.setTextBoxStyle (juce::Slider::NoTextBox, true, 0, 0);
+        sensSlider.setTooltip ("Onset sensitivity — drag, then click Analyse");
+        analyseBtn.onClick = [this] { analyseSelected(); };
+
+        // Analysis settings
+        addAndMakeVisible (settingsLabel);
+        settingsLabel.setText ("Window:", juce::dontSendNotification);
+        settingsLabel.setFont (juce::Font (juce::FontOptions{}.withHeight (10.f)));
+        settingsLabel.setColour (juce::Label::textColourId, juce::Colour (0xff8E8E93));
+
+        for (int i = 0; i < 3; ++i) addAndMakeVisible (winBtn[i]);
+        winBtn[0].setButtonText ("512");  winBtn[0].onClick = [this] { setWindow (512); };
+        winBtn[1].setButtonText ("1024"); winBtn[1].onClick = [this] { setWindow (1024); };
+        winBtn[2].setButtonText ("2048"); winBtn[2].onClick = [this] { setWindow (2048); };
+        winBtn[1].setToggleState (true, juce::dontSendNotification);
+
+        for (int i = 0; i < 3; ++i) addAndMakeVisible (hopBtn[i]);
+        hopBtn[0].setButtonText ("128"); hopBtn[0].onClick = [this] { setHop (128); };
+        hopBtn[1].setButtonText ("256"); hopBtn[1].onClick = [this] { setHop (256); };
+        hopBtn[2].setButtonText ("512"); hopBtn[2].onClick = [this] { setHop (512); };
+        hopBtn[2].setToggleState (true, juce::dontSendNotification);
+
+        addAndMakeVisible (hopLabel); addAndMakeVisible (mfccLabel);
+        hopLabel .setText ("Hop:",  juce::dontSendNotification);
+        mfccLabel.setText ("MFCC:", juce::dontSendNotification);
+        for (auto* l : { &hopLabel, &mfccLabel })
+        {
+            l->setFont (juce::Font (juce::FontOptions{}.withHeight (10.f)));
+            l->setColour (juce::Label::textColourId, juce::Colour (0xff8E8E93));
+        }
+
+        addAndMakeVisible (mfccSlider);
+        mfccSlider.setRange (4, 13, 1); mfccSlider.setValue (13);
+        mfccSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+        mfccSlider.setTextBoxStyle (juce::Slider::TextBoxLeft, false, 24, 14);
+        mfccSlider.onValueChange = [this] {
+            auto s = SampleDatabase::instance().getSettings();
+            s.mfccCoeff = (int)mfccSlider.getValue();
+            SampleDatabase::instance().setSettings (s);
+        };
+
+        // Analysis labels (right panel)
+        for (auto* l : { &keyDetLabel, &keyMetaLabel, &bpmLabel, &onsetLabel, &pitchLabel })
+        {
+            addAndMakeVisible (l);
+            l->setFont (juce::Font (juce::FontOptions{}.withHeight (12.f)));
+            l->setColour (juce::Label::textColourId, juce::Colour (0xffE0E0E5));
+        }
+
+        // Send-to-voice buttons (use ASCII to avoid encoding issues)
+        for (int v = 0; v < 3; ++v)
+        {
+            sendBtn[v].setButtonText ("-> V" + juce::String (v + 1));
+            addAndMakeVisible (sendBtn[v]);
+            sendBtn[v].onClick = [this, v] { sendToVoice (v); };
+        }
+
+        // Corpus view
+        addAndMakeVisible (corpusView);
+        corpusView.onSelect = [this] (int fileIdx) { selectFileRow (fileIdx); };
+
+        // Status label
+        addAndMakeVisible (statusLabel);
+        statusLabel.setFont (juce::Font (juce::FontOptions{}.withHeight (10.f)));
+        statusLabel.setColour (juce::Label::textColourId, juce::Colour (0xff8E8E93));
+
+        // Progress bar (hidden when idle)
+        addAndMakeVisible (progressBar_);
+        progressBar_.setVisible (false);
+        progressBar_.setColour (juce::ProgressBar::backgroundColourId, juce::Colour (0xff2A2A2E));
+        progressBar_.setColour (juce::ProgressBar::foregroundColourId, juce::Colour (0xff30D158));
+
+        // Drag dividers
+        addAndMakeVisible (hBar1); addAndMakeVisible (hBar2); addAndMakeVisible (vBar);
+        hBar1.onDelta = [this](int dx) {
+            listW_ = juce::jlimit (120, getWidth() - 500, listW_ + dx); resized();
+        };
+        hBar2.onDelta = [this](int dx) {
+            analysisW_ = juce::jlimit (140, 350, analysisW_ - dx); resized();
+        };
+        vBar.onDelta = [this](int dy) {
+            corpusH_ = juce::jlimit (80, getHeight() - 200, corpusH_ - dy); resized();
+        };
+
+        // Analysis worker
+        worker_.onProgress = [this] { onAnalysisProgress(); };
+
+        setSize (1000, 680);
+        startTimerHz (20);
+    }
+
+    ~SoundBrowserContent() override { stopTimer(); proc_.stopPreview(); }
+
+    //──────────────────────────────────────────────────────────────────────────
+    int getNumRows() override { return SampleDatabase::instance().size(); }
+
+    void paintListBoxItem (int row, juce::Graphics& g, int w, int h, bool sel) override
+    {
+        auto& entries = SampleDatabase::instance().getEntries();
+        if (row < 0 || row >= (int)entries.size()) return;
+        const auto& e = entries[(size_t)row];
+
+        if (sel) g.fillAll (juce::Colour (0xff30D158).withAlpha (0.22f));
+        else if (row % 2 == 0) g.fillAll (juce::Colour (0xff1E1E22));
+
+        // Cluster / status strip
+        if (e.valid)
+        {
+            int ci = (e.cluster >= 0 && e.cluster < 8) ? e.cluster : 7;
+            g.setColour (juce::Colour (kClusterCols[ci]));
+        }
+        else
+            g.setColour (juce::Colour (0xff555558));
+        g.fillRect (0, 2, 4, h - 4);
+
+        // Status icon
+        g.setFont (10.f);
+        if (!e.valid)
+        {
+            g.setColour (juce::Colour (0xff888888));
+            g.drawText ("...", 8, 0, 18, h, juce::Justification::centredLeft);
+        }
+
+        // Name
+        g.setColour (e.valid ? juce::Colour (0xffE0E0E5) : juce::Colour (0xff888888));
+        g.setFont (11.f);
+        int nameX = e.valid ? 10 : 26;
+        g.drawText (e.file.getFileNameWithoutExtension(), nameX, 0, w - 160, h,
+                    juce::Justification::centredLeft, true);
+
+        // Key + BPM
+        if (e.valid || e.metaBpm > 0.f || e.metaKey.isNotEmpty())
+        {
+            juce::String key  = e.valid ? e.keyName : e.metaKey;
+            float        bpm  = e.valid ? e.tempo   : e.metaBpm;
+            juce::String meta = key + (bpm > 0.f ? "  " + juce::String (bpm, 0) + " bpm" : "");
+            g.setColour (juce::Colour (0xff6E6E73)); g.setFont (10.f);
+            g.drawText (meta, w - 158, 0, 154, h, juce::Justification::centredRight, true);
+        }
+    }
+
+    // Use only selectedRowsChanged — listBoxItemClicked would fire twice per click
+    void listBoxItemClicked  (int, const juce::MouseEvent&) override {}
+    void selectedRowsChanged (int lastRow)                  override { selectFileRow (lastRow); }
+
+    //──────────────────────────────────────────────────────────────────────────
+    void resized() override
+    {
+        auto b = getLocalBounds();
+        const int toolH = 34;
+        const int barSz = 5;
+        const int ctrlH = 28;
+        const int settH = 24;
+
+        // Toolbar
+        auto top = b.removeFromTop (toolH);
+        statusLabel.setBounds (top.removeFromRight (200).reduced (4, 8));
+        addFileBtn  .setBounds (top.removeFromLeft (60).reduced (2, 5));
+        addFolderBtn.setBounds (top.removeFromLeft (68).reduced (2, 5));
+        rebuildBtn  .setBounds (top.removeFromLeft (110).reduced (2, 5));
+        removeBtn   .setBounds (top.removeFromLeft (68).reduced (2, 5));
+
+        // Corpus at bottom
+        corpusView.setBounds (b.removeFromBottom (corpusH_));
+        vBar       .setBounds (b.removeFromBottom (barSz));
+
+        // File list left
+        fileList.setBounds (b.removeFromLeft (listW_));
+        hBar1   .setBounds (b.removeFromLeft (barSz));
+
+        // Analysis panel right
+        auto right = b.removeFromRight (analysisW_);
+        hBar2 .setBounds (b.removeFromRight (barSz));
+        layoutAnalysisPanel (right);
+
+        // Center: settings row + controls bar + waveform
+        auto settRow = b.removeFromTop (settH);
+        layoutSettingsRow (settRow);
+        auto ctrlRow = b.removeFromBottom (ctrlH);
+        layoutControlsRow (ctrlRow);
+        waveComp.setBounds (b.removeFromTop (80));
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (juce::Colour (0xff1A1A1E));
+        paintMfccBars (g);
+    }
+
+private:
+    W2SamplerProcessor& proc_;
+
+    // Layout dimensions (draggable)
+    int listW_    = 280;
+    int analysisW_ = 210;
+    int corpusH_  = 200;
+
+    // Toolbar
+    juce::TextButton addFileBtn  { "+File" };
+    juce::TextButton addFolderBtn{ "+Folder" };
+    juce::TextButton rebuildBtn  { "Rebuild Corpus" };
+    juce::TextButton removeBtn   { "Remove" };
+    juce::Label      statusLabel;
+
+    // Controls bar
+    juce::TextButton analyseBtn { "Analyse" };
+    juce::TextButton playBtn, stopBtn;
+    juce::Slider     levelSlider, sensSlider;
+    juce::Label      sensLabel;
+
+    // Progress — shows spinning indicator while worker is busy
+    double             progressValue_ = -1.0;   // -1 = indeterminate
+    juce::ProgressBar  progressBar_   { progressValue_ };
+
+    // Settings row
+    juce::Label      settingsLabel, hopLabel, mfccLabel;
+    juce::TextButton winBtn[3], hopBtn[3];
+    juce::Slider     mfccSlider;
+
+    // Analysis panel labels
+    juce::Label keyDetLabel, keyMetaLabel, bpmLabel, onsetLabel, pitchLabel;
+    juce::TextButton sendBtn[3];
+    juce::Rectangle<int> mfccBounds_;
+
+    // Waveform — uses pre-computed WaveThumb (1024 pts) so paint() is O(width), not O(samples)
+    struct WaveComp : public juce::Component
+    {
+        WaveThumb          thumb_;
+        std::vector<float> onsets_;
+        float playhead_   = -1.f;
+        float sliceStart_ = -1.f;
+        float sliceEnd_   = -1.f;
+        bool  loading_    = false;
+        bool  hasData_    = false;
+
+        /** Called from worker callback — thumbnail already built, zero message-thread cost. */
+        void setBuffer (WaveThumb th, std::vector<float> o)
+        {
+            thumb_   = std::move (th);
+            onsets_  = std::move (o);
+            hasData_ = !thumb_.pts.empty();
+            sliceStart_ = sliceEnd_ = -1.f;
+            repaint();
+        }
+        /** Update onset markers only (after analysis) — no waveform reload needed. */
+        void setOnsets (std::vector<float> o) { onsets_ = std::move (o); repaint(); }
+        void setLoading (bool l)              { loading_ = l; repaint(); }
+        void setPlayhead (float p)            { if (std::abs (p - playhead_) > 0.0005f) { playhead_ = p; repaint(); } }
+        void setSliceRegion (float s, float e){ sliceStart_ = s; sliceEnd_ = e; repaint(); }
+        void clear()                          { thumb_ = {}; onsets_.clear(); hasData_ = false; repaint(); }
+
+        void paint (juce::Graphics& g) override
+        {
+            auto b = getLocalBounds();
+            const int W = b.getWidth(), H = b.getHeight();
+            g.fillAll (juce::Colour (0xff111115));
+            g.setColour (juce::Colour (0xff252528)); g.drawRect (b, 1);
+
+            if (loading_)
+            {
+                g.setColour (juce::Colour (0xff8E8E93)); g.setFont (11.f);
+                g.drawText ("Loading\xe2\x80\xa6", b, juce::Justification::centred);
+                return;
+            }
+
+            if (!hasData_)
+            {
+                g.setColour (juce::Colour (0xff6E6E73)); g.setFont (11.f);
+                g.drawText ("Select a file", b, juce::Justification::centred);
+                return;
+            }
+
+            const float cy = (float)H * 0.5f;
+            const int   N  = (int)thumb_.pts.size();   // = WaveThumb::kSize (1024)
+
+            // Slice region highlight
+            if (sliceStart_ >= 0.f && sliceEnd_ > sliceStart_)
+            {
+                int x0 = (int)(sliceStart_ * (float)W);
+                int x1 = (int)(sliceEnd_   * (float)W);
+                g.setColour (juce::Colour (0xff0A84FF).withAlpha (0.12f));
+                g.fillRect (x0, 0, x1 - x0, H);
+            }
+
+            // Waveform — O(width) lookup into pre-built thumbnail
+            g.setColour (juce::Colour (0xff3E7A8C));
+            for (int px = 0; px < W; ++px)
+            {
+                // Map screen pixel to thumbnail index range
+                int t0 = juce::jlimit (0, N-1, (int)((float)px       / (float)W * (float)N));
+                int t1 = juce::jlimit (0, N-1, (int)((float)(px + 1) / (float)W * (float)N));
+                float hi = 0.f, lo = 0.f;
+                for (int t = t0; t <= t1; ++t)
+                {
+                    hi = std::max (hi, thumb_.pts[(size_t)t].hi);
+                    lo = std::min (lo, thumb_.pts[(size_t)t].lo);
+                }
+                g.drawVerticalLine (px, cy - hi * cy, cy - lo * cy + 1.f);
+            }
+
+            // Centre line
+            g.setColour (juce::Colour (0xff303035));
+            g.drawHorizontalLine ((int)cy, 0.f, (float)W);
+
+            // Onset ticks — full height, semi-transparent orange
+            g.setColour (juce::Colour (0xffFF9F0A).withAlpha (0.55f));
+            for (float np : onsets_)
+                g.drawVerticalLine ((int)(np * (float)W), 0.f, (float)H);
+
+            // Slice region border
+            if (sliceStart_ >= 0.f)
+            {
+                g.setColour (juce::Colour (0xff0A84FF).withAlpha (0.8f));
+                g.drawVerticalLine ((int)(sliceStart_ * (float)W), 0.f, (float)H);
+                g.drawVerticalLine ((int)(sliceEnd_   * (float)W), 0.f, (float)H);
+            }
+
+            // Playhead
+            if (playhead_ >= 0.f)
+            {
+                g.setColour (juce::Colour (0xffFFD60A).withAlpha (0.9f));
+                g.drawVerticalLine ((int)(playhead_ * (float)W), 0.f, (float)H);
+            }
+        }
+    } waveComp;
+
+    juce::ListBox fileList { "files", this };
+    CorpusView    corpusView;
+    DragBar       hBar1 { true }, hBar2 { true }, vBar { false };
+
+    std::shared_ptr<juce::AudioBuffer<float>> previewBufPtr_;   // shared with processor — zero-copy
+    double                             previewSampleRate_ = 44100.0;
+    std::unique_ptr<juce::FileChooser> fileChooser_;
+    AnalysisWorker                     worker_;
+
+    int  selectedFileIdx_    = -1;
+    int  waveLoadGeneration_ = 0;  // incremented per load; lets stale callbacks self-cancel
+    bool waveLoading_        = false;
+    int  lastEntryCount_     = -1;   // avoids redundant corpus repaints in timer
+
+    //──────────────────────────────────────────────────────────────────────────
+    void layoutAnalysisPanel (juce::Rectangle<int> r)
+    {
+        r = r.reduced (5, 4);
+        int x = r.getX(), y = r.getY(), w = r.getWidth();
+        auto row = [&](int h) { juce::Rectangle<int> out{x, y, w, h}; y += h + 2; return out; };
+        keyDetLabel .setBounds (row (14));
+        keyMetaLabel.setBounds (row (14));
+        bpmLabel    .setBounds (row (14));
+        onsetLabel  .setBounds (row (14));
+        pitchLabel  .setBounds (row (14));
+        mfccBounds_ = { x, y, w, 72 }; y += 76;
+        for (int v = 0; v < 3; ++v) { sendBtn[v].setBounds (x, y, w, 22); y += 25; }
+    }
+
+    void layoutSettingsRow (juce::Rectangle<int> r)
+    {
+        r = r.reduced (2, 2);
+        settingsLabel.setBounds (r.removeFromLeft (50));
+        for (int i = 0; i < 3; ++i) winBtn[i].setBounds (r.removeFromLeft (38).reduced (1, 1));
+        r.removeFromLeft (8);
+        hopLabel.setBounds (r.removeFromLeft (30));
+        for (int i = 0; i < 3; ++i) hopBtn[i].setBounds (r.removeFromLeft (34).reduced (1, 1));
+        r.removeFromLeft (8);
+        mfccLabel.setBounds (r.removeFromLeft (36));
+        mfccSlider.setBounds (r.removeFromLeft (80).reduced (0, 2));
+    }
+
+    void layoutControlsRow (juce::Rectangle<int> r)
+    {
+        r = r.reduced (2, 3);
+        playBtn  .setBounds (r.removeFromLeft (28));
+        stopBtn  .setBounds (r.removeFromLeft (28));
+        levelSlider.setBounds (r.removeFromLeft (80).reduced (0, 2));
+        r.removeFromLeft (6);
+        analyseBtn.setBounds (r.removeFromLeft (64).reduced (0, 1));
+        r.removeFromLeft (4);
+        sensLabel.setBounds (r.removeFromLeft (32));
+        sensSlider.setBounds (r.removeFromLeft (100).reduced (0, 2));
+        r.removeFromLeft (4);
+        progressBar_.setBounds (r.reduced (0, 4));
+    }
+
+    //──────────────────────────────────────────────────────────────────────────
+    void timerCallback() override
+    {
+        // Playhead — only repaint waveform if position actually moved
+        float prog = proc_.getPreviewProgress();
+        waveComp.setPlayhead (prog);
+
+        // Progress bar + status
+        int  pending = worker_.pendingCount();
+        bool busy    = worker_.isBusy();
+        bool anyWork = busy || pending > 0 || waveLoading_;
+
+        progressBar_.setVisible (anyWork);
+        if (anyWork) progressValue_ = -1.0;   // indeterminate spin
+
+        juce::String status;
+        if (pending > 0)   status = "Analysing: " + juce::String (pending) + " left";
+        else if (busy)     status = "Analysing\xe2\x80\xa6";
+        else if (waveLoading_) status = "Loading\xe2\x80\xa6";
+        statusLabel.setText (status, juce::dontSendNotification);
+
+        // Corpus: only refresh when entry count changes (new files cached/added)
+        int nEntries = SampleDatabase::instance().size();
+        if (nEntries != lastEntryCount_)
+        {
+            lastEntryCount_ = nEntries;
+            corpusView.refresh (SampleDatabase::instance().getEntries(), selectedFileIdx_);
+        }
+    }
+
+    void onAnalysisProgress()
+    {
+        fileList.updateContent();
+        fileList.repaint();
+        // Refresh corpus whenever analysis completes (new umap2d may have been applied)
+        lastEntryCount_ = -1;  // force refresh in next timerCallback
+        corpusView.refresh (SampleDatabase::instance().getEntries(), selectedFileIdx_);
+
+        if (selectedFileIdx_ >= 0)
+        {
+            auto& entries = SampleDatabase::instance().getEntries();
+            if (selectedFileIdx_ < (int)entries.size()
+                && entries[(size_t)selectedFileIdx_].valid)
+            {
+                if (!waveLoading_)
+                    waveComp.setOnsets (entries[(size_t)selectedFileIdx_].analysis.onsetPositions);
+                refreshAnalysisPanel();
+            }
+        }
+    }
+
+    void selectFileRow (int row)
+    {
+        if (row < 0 || row == selectedFileIdx_) return;
+        selectedFileIdx_  = row;
+        proc_.stopPreview();
+        refreshWaveform();
+        refreshAnalysisPanel();
+    }
+
+    void refreshWaveform()
+    {
+        auto& entries = SampleDatabase::instance().getEntries();
+        if (selectedFileIdx_ < 0 || selectedFileIdx_ >= (int)entries.size())
+        {
+            waveComp.clear(); return;
+        }
+
+        juce::File f   = entries[(size_t)selectedFileIdx_].file;
+        int        idx = selectedFileIdx_;
+        int        gen = ++waveLoadGeneration_;
+        waveLoading_       = true;
+        previewBufPtr_     = nullptr;   // clear old buffer — will load on Play press
+        previewSampleRate_ = 44100.0;
+        waveComp.clear();
+        waveComp.setLoading (true);
+
+        // Worker builds WaveThumb with a sequential chunk read (no large allocation).
+        // buf arg is always nullptr — preview loads separately when Play is pressed.
+        worker_.addWaveformJob (f, [this, idx, gen]
+                                (std::shared_ptr<juce::AudioBuffer<float>> /*buf*/, double sr, WaveThumb thumb)
+        {
+            if (gen != waveLoadGeneration_) return;   // stale — user moved on
+            waveLoading_ = false;
+            waveComp.setLoading (false);
+            if (idx != selectedFileIdx_) return;
+
+            previewSampleRate_ = sr;   // sample rate for preview (loaded on Play press)
+
+            auto& ent = SampleDatabase::instance().getEntries();
+            std::vector<float> onsets;
+            if (idx < (int)ent.size() && ent[(size_t)idx].valid)
+                onsets = ent[(size_t)idx].analysis.onsetPositions;
+            waveComp.setBuffer (std::move (thumb), std::move (onsets));
+            waveComp.setSliceRegion (-1.f, -1.f);
+        });
+    }
+
+    void refreshAnalysisPanel()
+    {
+        auto& entries = SampleDatabase::instance().getEntries();
+
+        const SampleEntry* ep = (selectedFileIdx_ >= 0 && selectedFileIdx_ < (int)entries.size())
+                                ? &entries[(size_t)selectedFileIdx_] : nullptr;
+
+        if (!ep) {
+            for (auto* l : { &keyDetLabel, &keyMetaLabel, &bpmLabel, &onsetLabel, &pitchLabel })
+                l->setText ("", juce::dontSendNotification);
+            return;
+        }
+
+        // Key detected
+        if (ep->valid)
+            keyDetLabel.setText ("Key (analysis): " + ep->keyName
+                                 + "  (" + juce::String (ep->keyConf, 2) + ")",
+                                 juce::dontSendNotification);
+        else
+            keyDetLabel.setText ("Key (analysis): —", juce::dontSendNotification);
+
+        // Key metadata
+        keyMetaLabel.setText (ep->metaKey.isNotEmpty()
+                              ? "Key (metadata): " + ep->metaKey
+                              : "Key (metadata): —",
+                              juce::dontSendNotification);
+
+        // BPM
+        juce::String bpmStr = "BPM: ";
+        if (ep->valid && ep->tempo > 0.f)    bpmStr += juce::String (ep->tempo, 1);
+        else                                  bpmStr += "—";
+        if (ep->metaBpm > 0.f)               bpmStr += "   meta: " + juce::String (ep->metaBpm, 1);
+        bpmLabel.setText (bpmStr, juce::dontSendNotification);
+
+        // Onset count
+        if (ep->valid)
+            onsetLabel.setText ("Onsets: " + juce::String ((int)ep->analysis.onsetPositions.size()),
+                                juce::dontSendNotification);
+        else
+            onsetLabel.setText ("", juce::dontSendNotification);
+
+        // Pitch
+        if (ep->valid && ep->analysis.pitchHz > 0.f)
+            pitchLabel.setText ("Pitch: " + juce::String (ep->analysis.pitchHz, 1)
+                                + " Hz  (" + juce::String (ep->analysis.pitchConfidence, 2) + ")",
+                                juce::dontSendNotification);
+        else
+            pitchLabel.setText ("", juce::dontSendNotification);
+
+        repaint (mfccBounds_);
+    }
+
+    void paintMfccBars (juce::Graphics& g)
+    {
+        auto& entries = SampleDatabase::instance().getEntries();
+
+        const float* mfccPtr = nullptr;
+        if (selectedFileIdx_ >= 0 && selectedFileIdx_ < (int)entries.size()
+                 && entries[(size_t)selectedFileIdx_].valid)
+        {
+            mfccPtr = entries[(size_t)selectedFileIdx_].analysis.mfccMean.data();
+        }
+
+        if (!mfccPtr) return;
+
+        auto b = mfccBounds_;
+        g.setColour (juce::Colour (0xff1E1E22)); g.fillRect (b);
+        g.setColour (juce::Colour (0xff2E2E32)); g.drawRect (b, 1);
+
+        float bw = (float)b.getWidth() / 13.f;
+        float bh = (float)b.getHeight() - 16.f;
+        float lo = mfccPtr[0], hi = mfccPtr[0];
+        for (int c = 1; c < 13; ++c) { lo = std::min(lo, mfccPtr[c]); hi = std::max(hi, mfccPtr[c]); }
+        float range = hi - lo; if (range < 1e-6f) range = 1.f;
+
+        for (int c = 0; c < 13; ++c)
+        {
+            float norm = (mfccPtr[c] - lo) / range;
+            float barH = std::max (1.f, norm * bh);
+            float x    = (float)b.getX() + (float)c * bw + 1.f;
+            float y    = (float)b.getBottom() - barH - 10.f;
+            g.setColour (juce::Colour (0xff0A84FF).withAlpha (0.8f));
+            g.fillRect (x, y, bw - 2.f, barH);
+        }
+        g.setColour (juce::Colour (0xff6E6E73)); g.setFont (9.f);
+        g.drawText ("MFCC", b.withHeight (12), juce::Justification::topLeft);
+    }
+
+    //──────────────────────────────────────────────────────────────────────────
+    void analyseSelected()
+    {
+        auto& entries = SampleDatabase::instance().getEntries();
+        if (selectedFileIdx_ < 0 || selectedFileIdx_ >= (int)entries.size()) return;
+        juce::File f = entries[(size_t)selectedFileIdx_].file;
+        // forceReanalysis=true: bypass JSON cache so new sensitivity threshold actually applies
+        worker_.addFileJob (f, (float)sensSlider.getValue(), /*forceReanalysis=*/true);
+    }
+
+    void setWindow (int size)
+    {
+        auto s = SampleDatabase::instance().getSettings();
+        s.windowSize = size;
+        SampleDatabase::instance().setSettings (s);
+        for (int i = 0; i < 3; ++i)
+            winBtn[i].setToggleState (winBtn[i].getButtonText().getIntValue() == size,
+                                      juce::dontSendNotification);
+    }
+
+    void setHop (int size)
+    {
+        auto s = SampleDatabase::instance().getSettings();
+        s.hopSize = size;
+        SampleDatabase::instance().setSettings (s);
+        for (int i = 0; i < 3; ++i)
+            hopBtn[i].setToggleState (hopBtn[i].getButtonText().getIntValue() == size,
+                                      juce::dontSendNotification);
+    }
+
+    void triggerRebuildCorpus()
+    {
+        worker_.queueRebuildCorpus();
+    }
+
+    void removeSelected()
+    {
+        if (selectedFileIdx_ < 0) return;
+        proc_.stopPreview();
+        SampleDatabase::instance().removeEntry (selectedFileIdx_);
+        selectedFileIdx_  = juce::jlimit (-1, SampleDatabase::instance().size() - 1,
+                                          selectedFileIdx_ - 1);
+        fileList.updateContent();
+        fileList.repaint();
+        corpusView.refresh (SampleDatabase::instance().getEntries(), -1);
+        if (selectedFileIdx_ >= 0)
+        {
+            fileList.selectRow (selectedFileIdx_, false, true);
+            refreshWaveform();
+        }
+        else
+        {
+            waveComp.clear();
+            for (auto* l : { &keyDetLabel, &keyMetaLabel, &bpmLabel, &onsetLabel, &pitchLabel })
+                l->setText ("", juce::dontSendNotification);
+        }
+    }
+
+    void pickFiles()
+    {
+        fileChooser_ = std::make_unique<juce::FileChooser> (
+            "Add audio files", juce::File{}, "*.wav;*.aif;*.aiff;*.flac;*.mp3");
+        fileChooser_->launchAsync (
+            juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles
+            | juce::FileBrowserComponent::canSelectMultipleItems,
+            [this] (const juce::FileChooser& fc)
+            {
+                for (const auto& f : fc.getResults())
+                {
+                    SampleDatabase::instance().addFileToList (f);
+                    worker_.addCheckCacheJob (f);  // restore prior analysis from JSON cache
+                }
+                fileList.updateContent();
+                fileList.repaint();
+                // Auto-select first if nothing selected
+                if (selectedFileIdx_ < 0 && SampleDatabase::instance().size() > 0)
+                {
+                    selectedFileIdx_ = 0;
+                    fileList.selectRow (0, false, true);
+                    refreshWaveform(); refreshAnalysisPanel();
+                }
+            });
+    }
+
+    void pickFolder()
+    {
+        fileChooser_ = std::make_unique<juce::FileChooser> ("Add folder", juce::File{});
+        fileChooser_->launchAsync (
+            juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
+            [this] (const juce::FileChooser& fc)
+            {
+                auto results = fc.getResults();
+                if (results.isEmpty()) return;
+                juce::Array<juce::File> files;
+                for (const auto& ext : { "wav","aif","aiff","flac","mp3" })
+                    results[0].findChildFiles (files, juce::File::findFiles, false,
+                                               juce::String ("*.") + ext);
+                files.sort();
+                for (const auto& f : files)
+                {
+                    SampleDatabase::instance().addFileToList (f);
+                    worker_.addCheckCacheJob (f);  // restore prior analysis from JSON cache
+                }
+                // No auto analysis or corpus rebuild — user clicks Analyse / Rebuild manually
+                fileList.updateContent(); fileList.repaint();
+                if (selectedFileIdx_ < 0 && SampleDatabase::instance().size() > 0)
+                {
+                    selectedFileIdx_ = 0;
+                    fileList.selectRow (0, false, true);
+                    refreshWaveform(); refreshAnalysisPanel();
+                }
+            });
+    }
+
+    void sendToVoice (int v)
+    {
+        auto& entries = SampleDatabase::instance().getEntries();
+        if (selectedFileIdx_ < 0 || selectedFileIdx_ >= (int)entries.size()) return;
+        proc_.loadSingleFile (v, entries[(size_t)selectedFileIdx_].file);
+    }
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SoundBrowserContent)
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+class SoundBrowser : public juce::DocumentWindow
+{
+public:
+    explicit SoundBrowser (W2SamplerProcessor& p)
+        : juce::DocumentWindow ("W2 Sound Browser", juce::Colour (0xff1A1A1E),
+                                juce::DocumentWindow::closeButton),
+          content_ (p)
+    {
+        setUsingNativeTitleBar (true);
+        setContentNonOwned (&content_, true);
+        setResizable (true, false);
+        centreWithSize (1000, 680);
+    }
+
+    void closeButtonPressed() override { setVisible (false); }
+    void openOrFocus()        { setVisible (true); toFront (true); }
+
+private:
+    SoundBrowserContent content_;
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SoundBrowser)
+};

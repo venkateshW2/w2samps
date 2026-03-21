@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.22)
+cmake_minimum_required(VERSION 3.28)
 project(W2AudioPlugs VERSION 0.1.0)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -34,6 +34,21 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(JUCE clap-juce-extensions bungee)
 
+# ── Fetch flucoma-core (offline audio analysis: onset/MFCC/chroma/pitch) ─────
+# Disable flucoma's internal tests/examples and foonathan-memory extras
+set(FLUCOMA_TESTS                   OFF CACHE BOOL "" FORCE)
+set(FOONATHAN_MEMORY_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
+set(FOONATHAN_MEMORY_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(FOONATHAN_MEMORY_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+    flucoma-core
+    GIT_REPOSITORY https://github.com/flucoma/flucoma-core.git
+    GIT_TAG        main
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(flucoma-core)
+
 # ── Plugin definition ────────────────────────────────────────────────────────
 juce_add_plugin(W2Sampler
     COMPANY_NAME            "W2Audio"
@@ -59,6 +74,8 @@ target_sources(W2Sampler
         src/EuclideanSequencer.cpp
         src/SamplerVoice.cpp
         src/SampleLibrary.cpp
+        src/FluCoMaAnalyser.cpp
+        src/SampleDatabase.cpp
 )
 
 target_include_directories(W2Sampler PRIVATE src ${bungee_SOURCE_DIR})
@@ -80,6 +97,7 @@ target_link_libraries(W2Sampler
         juce::juce_gui_basics
         juce::juce_gui_extra
         bungee_library
+        FLUID_DECOMPOSITION
     PUBLIC
         juce::juce_recommended_config_flags
         juce::juce_recommended_lto_flags

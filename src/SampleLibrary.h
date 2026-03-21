@@ -1,6 +1,7 @@
 #pragma once
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_audio_formats/juce_audio_formats.h>
+#include "FluCoMaAnalyser.h"  // for FluCoMaResult field in Entry (populated by SoundBrowser path only)
 #include "OnsetDetector.h"
 #include "KeyDetector.h"
 
@@ -36,14 +37,16 @@ public:
         juce::String             name;      // filename without extension (for UI display)
         juce::File               file;      // original file path
 
-        // Onset detection results (populated after loadFolder via analyseOnsets())
-        // Empty until explicitly requested — onset analysis is expensive.
-        OnsetDetector::Result    onsets;    // onset positions (normalised 0–1) + estimated BPM
-        bool                     onsetsAnalysed = false; // true once analyseOnsets() has run
+        // ── Analysis results (populated by analyseOnsets()) ─────────────────
+        // FluCoMa full analysis result (MFCC / Chroma / SpectralShape / Pitch + key)
+        FluCoMaResult            analysis;
 
-        // Key detection results (populated alongside onsets)
-        KeyDetector::Result detectedKey;
-        bool                keyAnalysed = false;
+        // Legacy shim fields — populated from analysis for backward compat
+        // with existing code in VoiceChannel + PluginEditor.
+        OnsetDetector::Result    onsets;    // onset positions + estimatedBPM (from analysis)
+        bool                     onsetsAnalysed = false;
+        KeyDetector::Result      detectedKey;
+        bool                     keyAnalysed = false;
 
         // Level analysis (computed on load)
         float peakDb = -96.0f;   // peak level in dBFS
@@ -119,6 +122,34 @@ public:
         return loaded;
     }
 
+    /** Load a single file, replacing the current library contents. */
+    int loadSingleFile (const juce::File& file, juce::AudioFormatManager& formatMgr)
+    {
+        entries_.clear();
+        currentIndex.store (0);
+
+        std::unique_ptr<juce::AudioFormatReader> reader (formatMgr.createReaderFor (file));
+        if (reader == nullptr) return 0;
+
+        auto e = std::make_unique<Entry>();
+        e->sampleRate = reader->sampleRate;
+        e->name       = file.getFileNameWithoutExtension();
+        e->file       = file;
+        e->buffer.setSize ((int)reader->numChannels, (int)reader->lengthInSamples);
+        reader->read (&e->buffer, 0, (int)reader->lengthInSamples, 0, true, true);
+
+        double sumSq = 0.0; float peak = 0.0f;
+        int ns = e->buffer.getNumSamples(), nc = e->buffer.getNumChannels();
+        for (int s = 0; s < ns; ++s)
+            for (int c = 0; c < nc; ++c) { float v = e->buffer.getSample(c,s); peak=std::max(peak,std::abs(v)); sumSq+=(double)(v*v); }
+        e->peakDb = peak > 0.f ? 20.f * std::log10(peak) : -96.f;
+        float rms = (ns > 0 && nc > 0) ? (float)std::sqrt(sumSq/(double)(ns*nc)) : 0.f;
+        e->rmsDb = rms > 0.f ? 20.f * std::log10(rms) : -96.f;
+
+        entries_.push_back (std::move (e));
+        return 1;
+    }
+
     /**
      * Run onset detection on one entry (by index).
      * Call from message thread after loadFolder(). Fills entry->onsets.
@@ -134,10 +165,16 @@ public:
         if (e == nullptr) return false;
         if (e->onsetsAnalysed && !forceRerun) return false;
 
-        e->onsets         = OnsetDetector::analyse (e->buffer, e->sampleRate, sensitivity);
+        // Fast onset detection (spectral flux) — message thread safe, runs in ~ms
+        e->onsets = OnsetDetector::analyse (e->buffer, e->sampleRate, sensitivity);
         e->onsetsAnalysed = true;
-        e->detectedKey    = KeyDetector::analyse (e->buffer, e->sampleRate);
-        e->keyAnalysed    = true;
+
+        // Fast key detection (Goertzel chromagram) — message thread safe
+        if (!e->keyAnalysed || forceRerun)
+        {
+            e->detectedKey = KeyDetector::analyse (e->buffer, e->sampleRate);
+            e->keyAnalysed = true;
+        }
         return true;
     }
 

@@ -4,6 +4,7 @@
 #include "PluginProcessor.h"
 #include "WaveformDisplay.h"
 #include "FuncGen.h"
+#include "SoundBrowser.h"
 
 //==============================================================================
 // FuncGenCanvas — drawable Catmull-Rom curve editor for one FuncGen.
@@ -1245,7 +1246,15 @@ private:
     // Transport bar (y=0..38)
     juce::TextButton  playBtn    { "Play" };
     juce::Label       bpmLabel   { "", "BPM" };
-    juce::Slider      bpmSlider;
+    juce::Label       bpmDisplay;           // click to edit inline
+    juce::TextButton  tapBtn     { "TAP" };
+    // Tap tempo state
+    juce::int64       tapTimes_[4] = {};
+    int               tapCount_    = 0;
+    // Beat flash state
+    bool              beatFlash_   = false;
+    juce::int64       beatFlashMs_ = 0;
+    float             prevClockPhase_ = 0.f;
     static constexpr int kNumClkDivs = 4;
     static constexpr int kClkDivVals[kNumClkDivs] = { 1, 2, 4, 8 };
     juce::TextButton  clkDivBtns[kNumClkDivs];
@@ -1261,8 +1270,10 @@ private:
 
     // Timeline view (toggles with center rings)
     bool         showTimeline_ = false;
-    juce::TextButton tlToggleBtn { "TL" };
+    juce::TextButton tlToggleBtn  { "TL" };
+    juce::TextButton browseBtn    { "Browse" };
     TimelineView timelineView_;
+    std::unique_ptr<SoundBrowser> soundBrowser_;
 
     //==========================================================================
     // Per-voice UI (all three built; only selectedVoice shown in left panel)

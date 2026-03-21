@@ -121,6 +121,12 @@ public:
         loadCurrentSampleIntoVoice();
     }
 
+    void loadSingleFile (const juce::File& file, juce::AudioFormatManager& fmgr)
+    {
+        library_.loadSingleFile (file, fmgr);
+        loadCurrentSampleIntoVoice();
+    }
+
     //==========================================================================
     // Audio thread
 

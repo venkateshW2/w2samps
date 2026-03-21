@@ -139,6 +139,7 @@ public:
     //==========================================================================
     // Message-thread API
     void loadFolder      (int v, const juce::File& folder);
+    void loadSingleFile  (int v, const juce::File& file);
     void prevSample      (int v);
     void nextSample      (int v);
     void randomSample    (int v);
@@ -162,6 +163,23 @@ public:
 
     void setPlaying (bool p);
     bool getPlaying() const { return isPlaying_.load(); }
+
+    float getClockPhase() const { return clockPhaseUI_.load (std::memory_order_relaxed); }
+    void  requestClick()        { pendingClick_.store (true, std::memory_order_relaxed); }
+
+    // ── Preview playback (SoundBrowser) ──────────────────────────────────────
+    /** Takes a shared_ptr — no copy, both browser and processor share the same buffer. */
+    void  startPreview  (std::shared_ptr<juce::AudioBuffer<float>> buf, double srcRate);
+    void  stopPreview   () { previewPos_.store (-1, std::memory_order_relaxed); }
+    bool  isPreviewPlaying() const { return previewPos_.load (std::memory_order_relaxed) >= 0; }
+    void  setPreviewLevel (float lv) { previewLevel_.store (lv, std::memory_order_relaxed); }
+    /** 0..1 normalised position within the preview buffer, or -1 if stopped. */
+    float getPreviewProgress() const
+    {
+        int pos = previewPos_.load (std::memory_order_relaxed);
+        int len = previewLen_.load (std::memory_order_relaxed);
+        return (pos >= 0 && len > 0) ? (float)pos / (float)len : -1.f;
+    }
 
     float getOutputPeakL() const { return outputPeakL_.load (std::memory_order_relaxed); }
     float getOutputPeakR() const { return outputPeakR_.load (std::memory_order_relaxed); }
@@ -203,8 +221,19 @@ private:
     std::atomic<bool>  isPlaying_    { false };
     std::atomic<bool>  voiceMuted_[3];
     std::atomic<int>   soloVoice_    { -1 };
-    std::atomic<float> outputPeakL_ { 0.0f };
-    std::atomic<float> outputPeakR_ { 0.0f };
+    std::atomic<float> outputPeakL_    { 0.0f };
+    std::atomic<float> outputPeakR_    { 0.0f };
+    std::atomic<float> clockPhaseUI_   { 0.0f };
+    std::atomic<bool>  pendingClick_   { false };
+    int                clickSamplesLeft_ = 0;
+
+    // Preview playback (SoundBrowser) — shared_ptr avoids copying the buffer
+    std::shared_ptr<juce::AudioBuffer<float>> previewBufPtr_;
+    juce::CriticalSection    previewLock_;
+    double                   previewSrcRate_ = 44100.0;
+    std::atomic<int>         previewPos_    { -1 };
+    std::atomic<int>         previewLen_    { 0 };
+    std::atomic<float>       previewLevel_  { 0.7f };
 
     // K-weighting filter state (BS.1770, two stages × stereo)
     struct Biquad {
