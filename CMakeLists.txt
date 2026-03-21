@@ -23,7 +23,16 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 
-FetchContent_MakeAvailable(JUCE clap-juce-extensions)
+# ── Fetch Bungee (time-stretch / pitch-shift) ────────────────────────────────
+FetchContent_Declare(
+    bungee
+    GIT_REPOSITORY    https://github.com/bungee-audio-stretch/bungee.git
+    GIT_TAG           main
+    GIT_SHALLOW       FALSE
+    GIT_SUBMODULES_RECURSE TRUE
+)
+
+FetchContent_MakeAvailable(JUCE clap-juce-extensions bungee)
 
 # ── Plugin definition ────────────────────────────────────────────────────────
 juce_add_plugin(W2Sampler
@@ -52,7 +61,7 @@ target_sources(W2Sampler
         src/SampleLibrary.cpp
 )
 
-target_include_directories(W2Sampler PRIVATE src)
+target_include_directories(W2Sampler PRIVATE src ${bungee_SOURCE_DIR})
 
 # ── JUCE modules ─────────────────────────────────────────────────────────────
 target_link_libraries(W2Sampler
@@ -70,6 +79,7 @@ target_link_libraries(W2Sampler
         juce::juce_graphics
         juce::juce_gui_basics
         juce::juce_gui_extra
+        bungee_library
     PUBLIC
         juce::juce_recommended_config_flags
         juce::juce_recommended_lto_flags

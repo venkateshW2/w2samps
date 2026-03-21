@@ -1329,6 +1329,7 @@ private:
         juce::Label      limitLabel    { "", "Limit dB" };
         juce::Slider     smoothSlider;
         juce::Label      smoothLabel  { "", "Smooth ms" };
+        juce::TextButton bungeeBtn    { "RAW" };   // RAW = raw mode, STCH = Bungee mode
 
         // ── Modulation section (section 5, left panel) ───────────────────────
         static constexpr int kNumFg = 4;

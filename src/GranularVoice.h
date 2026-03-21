@@ -1,6 +1,7 @@
 #pragma once
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_dsp/juce_dsp.h>
+#include <bungee/Bungee.h>
 
 /**
  * GranularVoice — region-based looping sample voice with full DSP chain.
@@ -70,6 +71,9 @@ public:
 
         // Anti-click parameter smoothing (0 = off)
         float paramSmoothMs = 0.f;
+
+        // Pitch mode: false = raw (pitch changes speed), true = Bungee (pitch only)
+        bool bungeeEnabled = false;
     };
 
     //==========================================================================
@@ -111,6 +115,12 @@ public:
         // Reset parameter smoothers to defaults
         smFilterFreq_ = 20000.f; smFilterRes_ = 0.707f;
         smDrive_ = 0.f; smPreGain_ = 1.f; smGain_ = 1.f;
+
+        // Create Bungee stretcher for this sample rate
+        Bungee::SampleRates sr { (int) sampleRate, (int) sampleRate };
+        bungee_ = std::make_unique<BStretcher> (sr, 2, 0);
+        bungeeInBuf_.setSize (2, bungee_->maxInputFrameCount(), false, true, false);
+        bungeeNeedsInit_ = true;
     }
 
     /** Message thread: set or replace the source buffer. Full state reset. */
@@ -140,6 +150,7 @@ public:
         playing_   = true;
         needsPositionReset_ = true;
         triggerFadeRemaining_ = kTriggerFadeSamples;
+        bungeeNeedsInit_ = true;
         adsr_.noteOn();
     }
 
@@ -244,6 +255,113 @@ public:
         int srcChans  = buffer_->getNumChannels();
         int dstChans  = std::min (tempBuf_.getNumChannels(), 2);
 
+        bool canLoop = params.loopMode != LoopMode::Off
+                    && params.loopMode != LoopMode::OnsetSeq
+                    && params.loopMode != LoopMode::OnsetRnd;
+
+        // ── Bungee pitch-shift path (pitch independent of speed) ─────────────
+        if (params.bungeeEnabled && bungee_ != nullptr)
+        {
+            if (bungeeNeedsInit_)
+            {
+                bungeeReq_          = {};
+                bungeeReq_.position = lStart;
+                bungeeReq_.speed    = sourceRate_ / playbackRate;
+                bungeeReq_.pitch    = pitchRatio;
+                bungeeReq_.reset    = true;
+                bungeeReq_.resampleMode = resampleMode_autoOut;
+                bungee_->preroll (bungeeReq_);
+                bungeeNeedsInit_ = false;
+            }
+
+            int outFilled = 0;
+            int safetyGuard = 64;
+
+            while (outFilled < numSamples && safetyGuard-- > 0 && !exhausted_)
+            {
+                // Wrap position for loop mode
+                if (bungeeReq_.position >= lEnd)
+                {
+                    if (canLoop)
+                    {
+                        double span = std::max (1.0, lEnd - lStart);
+                        bungeeReq_.position = lStart + std::fmod (bungeeReq_.position - lStart, span);
+                        bungeeReq_.reset    = true;
+                    }
+                    else
+                    {
+                        exhausted_ = true;
+                        adsr_.noteOff();
+                        break;
+                    }
+                }
+
+                // Tell Bungee the speed/pitch for this grain
+                bungeeReq_.speed = sourceRate_ / playbackRate;
+                bungeeReq_.pitch = pitchRatio;
+
+                // Get the source window Bungee needs for this grain
+                Bungee::InputChunk ic = bungee_->specifyGrain (bungeeReq_);
+
+                // Fill grain input buffer with loop-wrapped source audio
+                int grainLen = std::min (ic.end - ic.begin, bungeeInBuf_.getNumSamples());
+                for (int s = 0; s < grainLen; ++s)
+                {
+                    double sp = (double)(ic.begin + s);
+                    // Wrap/clamp to region
+                    if (canLoop)
+                    {
+                        double span = std::max (1.0, lEnd - lStart);
+                        // Add enough multiples of span to ensure sp >= lStart
+                        double excess = sp - lStart;
+                        sp = lStart + std::fmod (excess + std::ceil (-excess / span) * span, span);
+                    }
+                    sp = std::clamp (sp, rgnStart, rgnEnd - 1.0);
+
+                    int   a    = (int) sp;
+                    int   b    = std::min (a + 1, srcLen - 1);
+                    float frac = (float)(sp - a);
+                    for (int ch = 0; ch < 2; ++ch)
+                    {
+                        int sc = ch % srcChans;
+                        bungeeInBuf_.setSample (ch, s,
+                            buffer_->getSample (sc, a) * (1.f - frac)
+                          + buffer_->getSample (sc, b) * frac);
+                    }
+                }
+
+                // Analyse + synthesise grain
+                // channelStride = maxInputFrameCount (JUCE AudioBuffer channels are contiguous per channel)
+                bungee_->analyseGrain (bungeeInBuf_.getReadPointer (0),
+                                       bungeeInBuf_.getNumSamples(), 0, 0);
+                bungee_->synthesiseGrain (bungeeOut_);
+
+                // Copy output frames to tempBuf_
+                if (bungeeOut_.frameCount > 0 && bungeeOut_.data != nullptr)
+                {
+                    int n = std::min (bungeeOut_.frameCount, numSamples - outFilled);
+                    for (int ch = 0; ch < dstChans; ++ch)
+                    {
+                        const float* src = bungeeOut_.data + (intptr_t)ch * bungeeOut_.channelStride;
+                        float*       dst = tempBuf_.getWritePointer (ch) + outFilled;
+                        std::copy (src, src + n, dst);
+                    }
+                    outFilled += n;
+                }
+
+                // Update UI play position
+                position_ = bungeeReq_.position;
+                if (srcLen > 0)
+                    playPosNorm_.store ((float)(position_ / srcLen), std::memory_order_relaxed);
+
+                // Advance Bungee to next grain position
+                bungeeReq_.reset = false;
+                bungee_->next (bungeeReq_);
+            }
+        }
+        else
+        {
+        // ── Raw path: pitch changes playback speed (original behaviour) ───────
         for (int i = 0; i < numSamples; ++i)
         {
             if (!exhausted_)
@@ -253,9 +371,6 @@ public:
 
                 // OnsetSeq/OnsetRnd: one-shot per trigger — do NOT loop internally.
                 // The sequencer in VoiceChannel advances the anchor on each hit.
-                bool canLoop = params.loopMode != LoopMode::Off
-                            && params.loopMode != LoopMode::OnsetSeq
-                            && params.loopMode != LoopMode::OnsetRnd;
                 if (pastLoopEnd && canLoop)
                 {
                     double span = lEnd - loopAnchorSamples_;
@@ -286,6 +401,7 @@ public:
                 position_ += effectiveStep;
             }
         }
+        } // end raw path else-block
 
         // ── ADSR envelope ─────────────────────────────────────────────────────
         adsr_.applyEnvelopeToBuffer (tempBuf_, 0, numSamples);
@@ -399,4 +515,12 @@ private:
     float smDrive_      = 0.f;
     float smPreGain_    = 1.f;
     float smGain_       = 1.f;
+
+    // Bungee pitch-shift (decouples pitch from playback speed)
+    using BStretcher = Bungee::Stretcher<Bungee::Basic>;
+    std::unique_ptr<BStretcher> bungee_;
+    Bungee::Request             bungeeReq_    {};
+    Bungee::OutputChunk         bungeeOut_    {};
+    juce::AudioBuffer<float>    bungeeInBuf_;
+    bool                        bungeeNeedsInit_ = true;
 };

@@ -71,6 +71,7 @@ public:
         juce::AudioParameterFloat* loopSizeMs   = nullptr; // 5–5000 ms
         juce::AudioParameterBool*  loopSizeLock = nullptr;
         juce::AudioParameterFloat* smoothMs     = nullptr; // 0–200 ms param smoothing
+        juce::AudioParameterBool*  bungeeMode   = nullptr; // true = Bungee pitch-only
 
         // Function generator modulation (4 per voice)
         static constexpr int kNumFg = 4;

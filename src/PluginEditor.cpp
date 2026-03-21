@@ -424,6 +424,20 @@ void W2SamplerEditor::buildVoiceUI (int v)
     leftContent_.addAndMakeVisible (ui.smoothSlider);
     leftContent_.addAndMakeVisible (ui.smoothLabel);
 
+    // Bungee pitch-mode toggle button
+    ui.bungeeBtn.setClickingTogglesState (false);
+    ui.bungeeBtn.onClick = [this, v] {
+        auto& p = proc.vp[v];
+        if (!p.bungeeMode) return;
+        bool next = !p.bungeeMode->get();
+        *p.bungeeMode = next;
+        voiceUI[v].bungeeBtn.setButtonText (next ? "STCH" : "RAW");
+        voiceUI[v].bungeeBtn.setColour (juce::TextButton::buttonColourId,
+            next ? juce::Colour (W2LookAndFeel::kActive) : juce::Colour (W2LookAndFeel::kPanel));
+        voiceUI[v].bungeeBtn.repaint();
+    };
+    leftContent_.addAndMakeVisible (ui.bungeeBtn);
+
     // Mod indicator bars — one per ModDest, overlaid below SOUND sliders
     {
         static const juce::Colour voiceColours[] = {
@@ -793,6 +807,7 @@ void W2SamplerEditor::hideVoiceAll()
         hide (ui.preGainSlider); hide (ui.preGainLabel);
         hide (ui.limitSlider);   hide (ui.limitLabel);
         hide (ui.smoothSlider);  hide (ui.smoothLabel);
+        hide (ui.bungeeBtn);
 
         for (auto& b : ui.rndLockBtns) hide (b);
         hide (ui.rndFxSlider);   hide (ui.rndFxLabel);
@@ -995,6 +1010,10 @@ void W2SamplerEditor::layoutVoicePanel (int v)
         placeSound (ui.gainLabel,    ui.gainSlider,    ModDest::None);
         placeSound (ui.limitLabel,   ui.limitSlider,   ModDest::None);
         placeSound (ui.smoothLabel,  ui.smoothSlider,  ModDest::None);
+        // Pitch mode toggle: full-width button row
+        ui.bungeeBtn.setBounds (x0, y, cw, rh);
+        ui.bungeeBtn.setVisible (true);
+        y += rh + 2;
         y += sectionGap;
     }
 
@@ -1630,7 +1649,13 @@ void W2SamplerEditor::syncVoiceFromParams (int v)
     ui.gainSlider.setValue     ((double)p.gain->get(), d);
     ui.preGainSlider.setValue  ((double)p.preGain->get(), d);
     ui.limitSlider.setValue    ((double)p.limitThresh->get(), d);
-    if (p.smoothMs) ui.smoothSlider.setValue ((double)p.smoothMs->get(), d);
+    if (p.smoothMs)   ui.smoothSlider.setValue ((double)p.smoothMs->get(), d);
+    if (p.bungeeMode) {
+        bool on = p.bungeeMode->get();
+        ui.bungeeBtn.setButtonText (on ? "STCH" : "RAW");
+        ui.bungeeBtn.setColour (juce::TextButton::buttonColourId,
+            on ? juce::Colour (W2LookAndFeel::kActive) : juce::Colour (W2LookAndFeel::kPanel));
+    }
     ui.loopMsSlider.setValue   ((double)p.loopSizeMs->get(), d);
     ui.rndFxSlider.setValue    ((double)p.rndFxChance->get(), d);
 

@@ -65,6 +65,7 @@ void W2SamplerProcessor::registerVoiceParams (int v, const juce::String& px)
     addParameter (p.loopSizeLock = new juce::AudioParameterBool  (px+"loopLock", "Loop Lock",  false));
     addParameter (p.smoothMs    = new juce::AudioParameterFloat (px+"smooth",  "Param Smooth",
                                        juce::NormalisableRange<float> (0.0f, 200.0f, 0.0f, 0.5f), 0.0f));
+    addParameter (p.bungeeMode  = new juce::AudioParameterBool  (px+"bungee",  "Bungee Pitch", false));
 
     // Function generators (4 per voice)
     for (int fg = 0; fg < W2SamplerProcessor::VoiceParamPtrs::kNumFg; ++fg)
@@ -287,7 +288,8 @@ void W2SamplerProcessor::fillVoiceParams (int v, VoiceChannel::Params& out) cons
     g.loopEnd        = p.loopEnd->get();
     g.loopSizeMs     = p.loopSizeMs->get();
     g.loopSizeLock   = p.loopSizeLock->get();
-    g.paramSmoothMs  = p.smoothMs ? p.smoothMs->get() : 0.0f;
+    g.paramSmoothMs  = p.smoothMs    ? p.smoothMs->get()    : 0.0f;
+    g.bungeeEnabled  = p.bungeeMode  ? p.bungeeMode->get()  : false;
 
     // FuncGen mod routing
     for (int fg = 0; fg < W2SamplerProcessor::VoiceParamPtrs::kNumFg; ++fg)
