@@ -604,23 +604,24 @@ public:
         levelSlider.setTextBoxStyle (juce::Slider::NoTextBox, true, 0, 0);
         levelSlider.setTooltip ("Preview level");
         levelSlider.onValueChange = [this] { proc_.setPreviewLevel ((float)levelSlider.getValue()); };
-        playBtn.onClick = [this] {
-            if (selectedFileIdx_ < 0) return;
+        playBtn.onClick = [this]
+        {
+            // If buffer already decoded, play it immediately
             if (previewBufPtr_ && previewBufPtr_->getNumSamples() > 0)
             {
-                // Buffer already loaded — start immediately
                 proc_.startPreview (previewBufPtr_, previewSampleRate_);
                 return;
             }
-            // Not loaded yet — queue a 30s load, start preview when ready
-            auto& ents = SampleDatabase::instance().getEntries();
-            if (selectedFileIdx_ >= (int)ents.size()) return;
-            juce::File f      = ents[(size_t)selectedFileIdx_].file;
-            int        capIdx = selectedFileIdx_;
-            worker_.addPreviewJob (f, [this, capIdx]
-                                   (std::shared_ptr<juce::AudioBuffer<float>> buf, double sr)
+
+            // Resolve the file to preview regardless of whether it's in the DB
+            juce::File f = resolveSelectedFile();
+            if (!f.existsAsFile()) return;
+
+            juce::File capFile = f;
+            worker_.addPreviewJob (f, [this, capFile]
+                (std::shared_ptr<juce::AudioBuffer<float>> buf, double sr)
             {
-                if (capIdx != selectedFileIdx_ || !buf) return;
+                if (!buf || capFile != resolveSelectedFile()) return;
                 previewBufPtr_     = buf;
                 previewSampleRate_ = sr;
                 proc_.startPreview (buf, sr);
@@ -905,7 +906,8 @@ public:
             if (info.isDirectory) return;  // don't load waveform for folders
 
             juce::File f = currentDir_.getChildFile (info.filename);
-            selectedFileIdx_ = -1;  // reset DB index
+            selectedFileIdx_    = -1;  // reset DB index
+            selectedBrowseFile_ = f;   // always track the actual file
 
             // Check if in SampleDatabase
             const SampleEntry* dbEntry = SampleDatabase::instance().getEntry (f);
@@ -1176,7 +1178,8 @@ private:
     double                             previewSampleRate_ = 44100.0;
     AnalysisWorker                     worker_;
 
-    int  selectedFileIdx_    = -1;
+    int        selectedFileIdx_    = -1;
+    juce::File selectedBrowseFile_;               // set in Browse mode even if not in DB
     int  waveLoadGeneration_ = 0;  // incremented per load; lets stale callbacks self-cancel
     bool waveLoading_        = false;
     int  lastEntryCount_     = -1;   // avoids redundant corpus repaints in timer
@@ -1491,10 +1494,19 @@ private:
 
     void analyseSelected()
     {
-        auto& entries = SampleDatabase::instance().getEntries();
-        if (selectedFileIdx_ < 0 || selectedFileIdx_ >= (int)entries.size()) return;
-        juce::File f = entries[(size_t)selectedFileIdx_].file;
-        // forceReanalysis=true: bypass JSON cache so new sensitivity threshold actually applies
+        juce::File f = resolveSelectedFile();
+        if (!f.existsAsFile()) return;
+
+        // If not yet in DB, register it first
+        if (selectedFileIdx_ < 0)
+        {
+            SampleDatabase::instance().addFileToList (f);
+            auto& entries = SampleDatabase::instance().getEntries();
+            for (int i = 0; i < (int)entries.size(); ++i)
+                if (entries[(size_t)i].file == f) { selectedFileIdx_ = i; break; }
+        }
+
+        // forceReanalysis=true: bypass JSON cache so new sensitivity applies
         worker_.addFileJob (f, (float)sensSlider.getValue(), /*forceReanalysis=*/true);
     }
 
@@ -1718,6 +1730,28 @@ private:
             fileList.updateContent();
             fileList.repaint();
         }
+    }
+
+    //──────────────────────────────────────────────────────────────────────────
+    // Resolve the currently selected file regardless of DB membership or mode
+    //──────────────────────────────────────────────────────────────────────────
+    juce::File resolveSelectedFile() const
+    {
+        if (leftMode_ == LeftMode::Playlist)
+        {
+            SampleEntry e;
+            if (selectedPlaylistRow_ >= 0 && currentPlaylist_.getEntry (selectedPlaylistRow_, e))
+                return e.file;
+            return {};
+        }
+        // Browse mode: prefer DB entry (has correct file path), fall back to tracked file
+        if (selectedFileIdx_ >= 0)
+        {
+            auto& ents = SampleDatabase::instance().getEntries();
+            if (selectedFileIdx_ < (int)ents.size())
+                return ents[(size_t)selectedFileIdx_].file;
+        }
+        return selectedBrowseFile_;
     }
 
     //──────────────────────────────────────────────────────────────────────────

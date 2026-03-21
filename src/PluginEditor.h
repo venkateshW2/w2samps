@@ -1233,6 +1233,13 @@ public:
             return;
         }
 
+        if (nOnsets_ == 0)
+        {
+            g.setColour (juce::Colour (0xff555558)); g.setFont (10.f);
+            g.drawText ("Analyse a sample to map onsets per hit", b, juce::Justification::centred);
+            return;
+        }
+
         auto& mapper = proc_->getVoice (voice_).getOnsetHitMapper();
         int dispOnsets = std::min (nOnsets_, 15);
         int rows = 1 + dispOnsets;   // "Auto" row + onset rows
@@ -1276,7 +1283,7 @@ public:
 
             int8_t assigned = mapper.peek (c);
             float  dotX = cx + cw * 0.5f;
-            float  dotR = std::min (cw, rh) * 0.3f;
+            float  dotR = std::min ({ cw * 0.3f, rh * 0.3f, 6.f });
 
             if (assigned < 0)
             {
