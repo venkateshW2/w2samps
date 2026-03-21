@@ -408,6 +408,32 @@ void W2SamplerProcessor::loadSingleFile (int v, const juce::File& file)
     *p.loopStart   = 0.0f;  *p.loopEnd   = 0.25f;
 }
 
+void W2SamplerProcessor::loadSingleFileWithAnalysis (int v, const juce::File& file,
+                                                     const FluCoMaResult& analysis)
+{
+    if (v < 0 || v > 2) return;
+    voices_[v].loadSingleFile (file, formatManager_);
+
+    // Inject FluCoMa analysis into the library entry — no re-analysis needed
+    auto& lib = voices_[v].getLibrary();
+    if (auto* e = const_cast<SampleLibrary::Entry*> (lib.getEntry (0)))
+    {
+        e->analysis         = analysis;
+        e->onsetsAnalysed   = true;
+        // Populate legacy shim fields used by VoiceChannel + waveform display
+        e->onsets.positions   = analysis.onsetPositions;
+        e->onsets.count       = (int)analysis.onsetPositions.size();
+        e->onsets.estimatedBPM = analysis.estimatedBpm;
+        e->detectedKey.keyName    = analysis.keyName;
+        e->detectedKey.confidence = analysis.keyConfidence;
+        e->keyAnalysed = true;
+    }
+
+    auto& p = vp[v];
+    *p.regionStart = 0.0f;  *p.regionEnd = 1.0f;
+    *p.loopStart   = 0.0f;  *p.loopEnd   = 0.25f;
+}
+
 void W2SamplerProcessor::prevSample   (int v) { if (v>=0&&v<3) voices_[v].prevSample(); }
 void W2SamplerProcessor::nextSample   (int v) { if (v>=0&&v<3) voices_[v].nextSample(); }
 void W2SamplerProcessor::randomSample (int v) { if (v>=0&&v<3) voices_[v].randomSample(); }

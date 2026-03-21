@@ -4,6 +4,7 @@
 #include "MasterClock.h"
 #include "VoiceChannel.h"
 #include "TimelineEnv.h"
+#include "FluCoMaAnalyser.h"
 
 /**
  * W2SamplerProcessor — Phase 1 (phasor-based, 3 voices).
@@ -140,6 +141,9 @@ public:
     // Message-thread API
     void loadFolder      (int v, const juce::File& folder);
     void loadSingleFile  (int v, const juce::File& file);
+    /** Load file and inject pre-computed FluCoMa analysis (onset positions, key, BPM etc.)
+     *  from SoundBrowser. Skips redundant re-analysis. Message thread only. */
+    void loadSingleFileWithAnalysis (int v, const juce::File& file, const FluCoMaResult& analysis);
     void prevSample      (int v);
     void nextSample      (int v);
     void randomSample    (int v);

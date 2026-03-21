@@ -15,6 +15,7 @@
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_audio_formats/juce_audio_formats.h>
 #include "SampleDatabase.h"
+#include "Playlist.h"
 #include "PluginProcessor.h"
 
 #if defined (__APPLE__)
@@ -516,12 +517,13 @@ public:
     explicit SoundBrowserContent (W2SamplerProcessor& p) : proc_ (p)
     {
         // Toolbar
-        for (auto* b : { &addFileBtn, &addFolderBtn, &rebuildBtn, &removeBtn })
+        for (auto* b : { &addFileBtn, &addFolderBtn, &analyseAllBtn, &rebuildBtn, &removeBtn })
             addAndMakeVisible (b);
-        addFileBtn  .onClick = [this] { pickFiles(); };
-        addFolderBtn.onClick = [this] { pickFolder(); };
-        rebuildBtn  .onClick = [this] { triggerRebuildCorpus(); };
-        removeBtn   .onClick = [this] { removeSelected(); };
+        addFileBtn   .onClick = [this] { pickFiles(); };
+        addFolderBtn .onClick = [this] { pickFolder(); };
+        analyseAllBtn.onClick = [this] { analyseAll(); };
+        rebuildBtn   .onClick = [this] { triggerRebuildCorpus(); };
+        removeBtn    .onClick = [this] { removeSelected(); };
         removeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff3A1A1A));
 
         // File list
@@ -638,6 +640,25 @@ public:
         addAndMakeVisible (corpusView);
         corpusView.onSelect = [this] (int fileIdx) { selectFileRow (fileIdx); };
 
+        // ── Playlist strip (below waveform) ───────────────────────────────────
+        addAndMakeVisible (plLabel);
+        plLabel.setText ("Playlist:", juce::dontSendNotification);
+        plLabel.setFont (juce::Font (juce::FontOptions{}.withHeight (11.f)));
+        plLabel.setColour (juce::Label::textColourId, juce::Colour (0xff8E8E93));
+
+        addAndMakeVisible (plCombo);
+        plCombo.setTextWhenNothingSelected ("— select or create —");
+        plCombo.onChange = [this] { onPlaylistComboChanged(); };
+        refreshPlaylistCombo();
+
+        addAndMakeVisible (plAddBtn);
+        plAddBtn.setButtonText ("+ Add");
+        plAddBtn.onClick = [this] { addSelectedToPlaylist(); };
+
+        addAndMakeVisible (plNewBtn);
+        plNewBtn.setButtonText ("New");
+        plNewBtn.onClick = [this] { createNewPlaylist(); };
+
         // Status label
         addAndMakeVisible (statusLabel);
         statusLabel.setFont (juce::Font (juce::FontOptions{}.withHeight (10.f)));
@@ -733,11 +754,12 @@ public:
 
         // Toolbar
         auto top = b.removeFromTop (toolH);
-        statusLabel.setBounds (top.removeFromRight (200).reduced (4, 8));
-        addFileBtn  .setBounds (top.removeFromLeft (60).reduced (2, 5));
-        addFolderBtn.setBounds (top.removeFromLeft (68).reduced (2, 5));
-        rebuildBtn  .setBounds (top.removeFromLeft (110).reduced (2, 5));
-        removeBtn   .setBounds (top.removeFromLeft (68).reduced (2, 5));
+        statusLabel .setBounds (top.removeFromRight (200).reduced (4, 8));
+        addFileBtn  .setBounds (top.removeFromLeft (54).reduced (2, 5));
+        addFolderBtn.setBounds (top.removeFromLeft (62).reduced (2, 5));
+        analyseAllBtn.setBounds(top.removeFromLeft (80).reduced (2, 5));
+        rebuildBtn  .setBounds (top.removeFromLeft (108).reduced (2, 5));
+        removeBtn   .setBounds (top.removeFromLeft (62).reduced (2, 5));
 
         // Corpus at bottom
         corpusView.setBounds (b.removeFromBottom (corpusH_));
@@ -752,11 +774,13 @@ public:
         hBar2 .setBounds (b.removeFromRight (barSz));
         layoutAnalysisPanel (right);
 
-        // Center: settings row + controls bar + waveform
+        // Center: settings row + controls bar + waveform + playlist strip
         auto settRow = b.removeFromTop (settH);
         layoutSettingsRow (settRow);
         auto ctrlRow = b.removeFromBottom (ctrlH);
         layoutControlsRow (ctrlRow);
+        auto plRow = b.removeFromBottom (26);
+        layoutPlaylistRow (plRow);
         waveComp.setBounds (b.removeFromTop (80));
     }
 
@@ -775,11 +799,18 @@ private:
     int corpusH_  = 200;
 
     // Toolbar
-    juce::TextButton addFileBtn  { "+File" };
-    juce::TextButton addFolderBtn{ "+Folder" };
-    juce::TextButton rebuildBtn  { "Rebuild Corpus" };
-    juce::TextButton removeBtn   { "Remove" };
+    juce::TextButton addFileBtn   { "+File" };
+    juce::TextButton addFolderBtn { "+Folder" };
+    juce::TextButton analyseAllBtn{ "Analyse All" };
+    juce::TextButton rebuildBtn   { "Rebuild Corpus" };
+    juce::TextButton removeBtn    { "Remove" };
     juce::Label      statusLabel;
+
+    // Playlist strip (below waveform)
+    juce::Label      plLabel;
+    juce::ComboBox   plCombo;
+    juce::TextButton plAddBtn, plNewBtn;
+    Playlist         currentPlaylist_;     // the playlist currently shown in plCombo
 
     // Controls bar
     juce::TextButton analyseBtn { "Analyse" };
@@ -958,6 +989,16 @@ private:
         sensSlider.setBounds (r.removeFromLeft (100).reduced (0, 2));
         r.removeFromLeft (4);
         progressBar_.setBounds (r.reduced (0, 4));
+    }
+
+    void layoutPlaylistRow (juce::Rectangle<int> r)
+    {
+        r = r.reduced (2, 3);
+        plLabel .setBounds (r.removeFromLeft (54));
+        plAddBtn.setBounds (r.removeFromRight (46).reduced (1, 1));
+        plNewBtn.setBounds (r.removeFromRight (46).reduced (1, 1));
+        r.removeFromRight (4);
+        plCombo .setBounds (r);
     }
 
     //──────────────────────────────────────────────────────────────────────────
@@ -1264,7 +1305,117 @@ private:
     {
         auto& entries = SampleDatabase::instance().getEntries();
         if (selectedFileIdx_ < 0 || selectedFileIdx_ >= (int)entries.size()) return;
-        proc_.loadSingleFile (v, entries[(size_t)selectedFileIdx_].file);
+        const auto& e = entries[(size_t)selectedFileIdx_];
+        if (e.valid)
+            proc_.loadSingleFileWithAnalysis (v, e.file, e.analysis);
+        else
+            proc_.loadSingleFile (v, e.file);
+    }
+
+    //──────────────────────────────────────────────────────────────────────────
+    // Analyse All — queues AnalyseFile for every unanalysed entry
+    //──────────────────────────────────────────────────────────────────────────
+    void analyseAll()
+    {
+        float sens = (float)sensSlider.getValue();
+        const auto& entries = SampleDatabase::instance().getEntries();
+        for (const auto& e : entries)
+            if (!e.valid)
+                worker_.addFileJob (e.file, sens);
+    }
+
+    //──────────────────────────────────────────────────────────────────────────
+    // Playlist helpers
+    //──────────────────────────────────────────────────────────────────────────
+    void refreshPlaylistCombo()
+    {
+        juce::StringArray names = Playlist::listSaved();
+        plCombo.clear (juce::dontSendNotification);
+        int id = 1;
+        for (const auto& n : names)
+            plCombo.addItem (n, id++);
+
+        // Re-select current playlist if it still exists
+        if (currentPlaylist_.name.isNotEmpty())
+        {
+            int idx = names.indexOf (currentPlaylist_.name);
+            if (idx >= 0) plCombo.setSelectedItemIndex (idx, juce::dontSendNotification);
+        }
+    }
+
+    void onPlaylistComboChanged()
+    {
+        juce::String sel = plCombo.getText();
+        if (sel.isEmpty()) return;
+        if (currentPlaylist_.name == sel) return;
+
+        // Save current if dirty
+        if (currentPlaylist_.isDirty()) currentPlaylist_.save();
+
+        Playlist pl;
+        if (Playlist::load (sel, pl))
+            currentPlaylist_ = std::move (pl);
+    }
+
+    void createNewPlaylist()
+    {
+        // Use a simple non-modal dialog: juce::AlertWindow with a text field
+        auto* dialog = new juce::AlertWindow ("New Playlist", "Enter playlist name:",
+                                              juce::MessageBoxIconType::NoIcon);
+        dialog->addTextEditor ("name", "", "Name:");
+        dialog->addButton ("Create", 1);
+        dialog->addButton ("Cancel", 0);
+        dialog->enterModalState (true, juce::ModalCallbackFunction::create (
+            [this, dialog] (int result)
+            {
+                if (result == 1)
+                {
+                    juce::String name = dialog->getTextEditorContents ("name").trim();
+                    if (name.isNotEmpty())
+                    {
+                        if (currentPlaylist_.isDirty()) currentPlaylist_.save();
+                        currentPlaylist_ = Playlist();
+                        currentPlaylist_.name = name;
+                        currentPlaylist_.save();
+                        refreshPlaylistCombo();
+                        juce::StringArray names = Playlist::listSaved();
+                        int idx = names.indexOf (name);
+                        if (idx >= 0)
+                            plCombo.setSelectedItemIndex (idx, juce::dontSendNotification);
+                    }
+                }
+                delete dialog;
+            }), true);
+    }
+
+    void addSelectedToPlaylist()
+    {
+        if (currentPlaylist_.name.isEmpty())
+        {
+            // No playlist selected — prompt to create one
+            createNewPlaylist();
+            return;
+        }
+
+        auto& entries = SampleDatabase::instance().getEntries();
+        if (selectedFileIdx_ < 0 || selectedFileIdx_ >= (int)entries.size()) return;
+        const auto& e = entries[(size_t)selectedFileIdx_];
+
+        if (!e.valid)
+        {
+            // Queue analysis first — not yet analysed
+            worker_.addFileJob (e.file, (float)sensSlider.getValue());
+            juce::AlertWindow::showMessageBoxAsync (
+                juce::AlertWindow::InfoIcon, "Not Yet Analysed",
+                "Queueing analysis. Re-add to playlist after analysis completes.");
+            return;
+        }
+
+        currentPlaylist_.addEntry (e);
+        currentPlaylist_.save();
+
+        statusLabel.setText ("Added to \"" + currentPlaylist_.name + "\"",
+                             juce::dontSendNotification);
     }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SoundBrowserContent)
