@@ -114,13 +114,34 @@ void W2SamplerEditor::buildTransportBar()
     bpmLabel.setText ("BPM", juce::dontSendNotification);
     addAndMakeVisible (bpmLabel);
 
-    // BPM as drag-number display
+    // BPM as drag-number display (vertical drag = natural; double-click to type)
     styleSlider (bpmSlider, 20.0f, 999.0f, proc.bpm->get());
     bpmSlider.setName ("bpm_drag");
-    bpmSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+    bpmSlider.setSliderStyle (juce::Slider::LinearVertical);
     bpmSlider.setTextBoxStyle (juce::Slider::NoTextBox, true, 0, 0);
-    bpmSlider.setPopupDisplayEnabled (false, false, nullptr);
+    bpmSlider.setPopupDisplayEnabled (true, true, this);
+    bpmSlider.setDoubleClickReturnValue (false, 0.0); // disable reset; double-click opens text entry
+    bpmSlider.setVelocityBasedMode (true);
+    bpmSlider.setVelocityModeParameters (1.5, 1, 0.05);
     bpmSlider.onValueChange = [this] { *proc.bpm = (float)bpmSlider.getValue(); };
+    // Double-click to type BPM value
+    struct BpmTyper : public juce::MouseListener {
+        juce::Slider& sl; W2SamplerProcessor& proc;
+        BpmTyper (juce::Slider& s, W2SamplerProcessor& p) : sl(s), proc(p) {}
+        void mouseDoubleClick (const juce::MouseEvent&) override {
+            auto dlg = std::make_shared<juce::AlertWindow> ("BPM", "Enter BPM (20–999):", juce::MessageBoxIconType::NoIcon);
+            dlg->addTextEditor ("bpm", juce::String ((int)sl.getValue()), "");
+            dlg->addButton ("OK",     1, juce::KeyPress (juce::KeyPress::returnKey));
+            dlg->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+            dlg->enterModalState (true, juce::ModalCallbackFunction::create ([this, dlg] (int r) {
+                if (r == 1) {
+                    double v = std::clamp (dlg->getTextEditorContents("bpm").getDoubleValue(), 20.0, 999.0);
+                    sl.setValue (v, juce::sendNotificationAsync);
+                }
+            }), false);
+        }
+    };
+    bpmSlider.addMouseListener (new BpmTyper (bpmSlider, proc), false);
     addAndMakeVisible (bpmSlider);
 
     const char* divNames[] = { "1 Beat", "2 Beats", "4=Bar", "8=2Bar" };
@@ -882,11 +903,12 @@ void W2SamplerEditor::layoutVoicePanel (int v)
             ui.nameLabel.setBounds (x0, y, panW, 18); ui.nameLabel.setVisible (true);
             y += 18 + rowGap;
         }
-        // Onset sens
+        // Onset sens + RAW/STCH toggle on same row
         {
-            const int h = 24;
-            ui.onsetSensLabel .setBounds (x0,      y, 36, h); ui.onsetSensLabel .setVisible (true);
-            ui.onsetSensSlider.setBounds (x0 + 38, y, panW - 38, h); ui.onsetSensSlider.setVisible (true);
+            const int h = 24, btnW = 50;
+            ui.onsetSensLabel .setBounds (x0,                       y, 36,             h); ui.onsetSensLabel .setVisible (true);
+            ui.onsetSensSlider.setBounds (x0 + 38,                  y, panW-38-btnW-4, h); ui.onsetSensSlider.setVisible (true);
+            ui.bungeeBtn      .setBounds (x0 + panW - btnW,         y, btnW,           h); ui.bungeeBtn.setVisible (true);
             y += h + rowGap;
         }
         // Waveform
@@ -1010,10 +1032,6 @@ void W2SamplerEditor::layoutVoicePanel (int v)
         placeSound (ui.gainLabel,    ui.gainSlider,    ModDest::None);
         placeSound (ui.limitLabel,   ui.limitSlider,   ModDest::None);
         placeSound (ui.smoothLabel,  ui.smoothSlider,  ModDest::None);
-        // Pitch mode toggle: full-width button row
-        ui.bungeeBtn.setBounds (x0, y, cw, rh);
-        ui.bungeeBtn.setVisible (true);
-        y += rh + 2;
         y += sectionGap;
     }
 
